@@ -16,6 +16,7 @@ import (
 	"github.com/Wizard815/Argos/internal/chain"
 	"github.com/Wizard815/Argos/internal/config"
 	"github.com/Wizard815/Argos/internal/event"
+	"github.com/Wizard815/Argos/internal/router/scheduler"
 	"github.com/Wizard815/Argos/internal/swaputil"
 )
 
@@ -408,6 +409,9 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			r = r.WithContext(ctx)
 			id := t.Add(r, cancel)
 			defer t.Remove(id)
+			defer scheduler.Marks.Forget(id)
+			// the scheduler knows the request by this id: a hold from Schedule -> Live reaches it
+			r = r.WithContext(scheduler.WithRequestID(r.Context(), id))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})
@@ -449,6 +453,8 @@ func CreateUpstreamInflightMiddleware(t *inflightTracker, cfg config.Config) cha
 			tracked.URL.Path = remainingPath
 			id := t.Add(tracked, cancel)
 			defer t.Remove(id)
+			defer scheduler.Marks.Forget(id)
+			r = r.WithContext(scheduler.WithRequestID(r.Context(), id))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})

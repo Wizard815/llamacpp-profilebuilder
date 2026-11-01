@@ -22,6 +22,7 @@ import (
 	"github.com/Wizard815/Argos/internal/perf"
 	"github.com/Wizard815/Argos/internal/process"
 	"github.com/Wizard815/Argos/internal/router"
+	"github.com/Wizard815/Argos/internal/router/scheduler"
 	"github.com/Wizard815/Argos/internal/store"
 	"github.com/Wizard815/Argos/internal/swaputil"
 )
@@ -303,6 +304,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	s.restoreProfileState()
 	// crashes: a model that dies on every request is stopped from reloading forever
 	router.WatchExits()
+	scheduler.Marks.SetNote(s.inflight.SetHeld) // the queue says why a request waits
 	if s.perf != nil {
 		router.SetCardUsedSource(s.liveCardUsed)
 	}
@@ -483,6 +485,8 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/inflight", apiChain.ThenFunc(s.handleAPIInflight))
 	mux.Handle("POST /api/inflight/{id}/cancel", apiChain.ThenFunc(s.handleAPICancelInflight))
 	mux.Handle("POST /api/inflight/{id}/next", apiChain.ThenFunc(s.handleAPIInflightNext))
+	mux.Handle("POST /api/inflight/{id}/hold", apiChain.ThenFunc(s.handleAPIInflightHold))
+	mux.Handle("DELETE /api/inflight/{id}/hold", apiChain.ThenFunc(s.handleAPIInflightHold))
 	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
 	mux.Handle("GET /api/metrics/activity", apiChain.ThenFunc(s.handleAPIActivity))
 	mux.Handle("GET /api/metrics/stats", apiChain.ThenFunc(s.handleAPIActivityStats))

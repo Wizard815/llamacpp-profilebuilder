@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wizard815/Argos/internal/config"
@@ -138,10 +139,20 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// (3b) Held from Schedule -> Live, or would unload a model used a moment ago:
+	// wait, rechecked every second (OnTick).
+	if why := s.waitReason(req, evict); why != "" {
+		s.logger.Debugf("%s: queuing request for model %s (%s)", s.name, req.Model, why)
+		s.enqueue(req)
+		Marks.say(RequestID(req.Ctx), why)
+		return
+	}
+
 	// (4) Collision with an in-flight swap — queue.
 	if collidesWith(req.Model, evict, s.active) {
 		s.logger.Debugf("%s: queuing request for model %s (collides with in-flight swap)", s.name, req.Model)
 		s.enqueue(req)
+		Marks.say(RequestID(req.Ctx), "waiting for another model to finish loading")
 		return
 	}
 
@@ -150,6 +161,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	if s.conflictsWithWork(evict, req.Model) {
 		s.logger.Debugf("%s: queuing request for model %s (would evict a process with work)", s.name, req.Model)
 		s.enqueue(req)
+		Marks.say(RequestID(req.Ctx), fmt.Sprintf("waiting for room: %s is busy and is not unloaded mid-request", strings.Join(evict, ", ")))
 		return
 	}
 
@@ -321,6 +333,7 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 		s.logger.Debugf("failed to set fifo_priority metadata: %v", err)
 	}
 
+	Marks.say(RequestID(req.Ctx), "")
 	if s.effects.GrantServe(req, modelID) {
 		s.inFlight[modelID]++
 		if req.Intent == swaputil.IntentPrefill {
@@ -408,6 +421,7 @@ func (s *FIFO) limit(modelID string) int {
 // the set EvictionFor saw, forwarded to OnSwapStart so the planner logs against
 // the same picture it decided on.
 func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
+	Marks.say(RequestID(initial.Ctx), "")
 	s.active[initial.Model] = &activeSwap{
 		modelID: initial.Model,
 		evict:   evict,
@@ -465,6 +479,11 @@ func (s *FIFO) drainQueue() {
 			s.grantHandler(req, req.Model)
 			continue
 		}
+		if why := s.waitReason(req, evict); why != "" {
+			Marks.say(RequestID(req.Ctx), why)
+			remaining = append(remaining, req)
+			continue
+		}
 		if collidesWith(req.Model, evict, s.active) {
 			remaining = append(remaining, req)
 			continue
@@ -478,6 +497,37 @@ func (s *FIFO) drainQueue() {
 	}
 	s.queued = remaining
 	broadcastQueuePositions(s.queued)
+}
+
+// waitReason says why req must wait rather than unload evict, or "": a person
+// held it, or a model it would unload was used a moment ago and stays loaded
+// for the next prompt of its chat (unless the request was sent on).
+func (s *FIFO) waitReason(req HandlerReq, evict []string) string {
+	if len(evict) == 0 {
+		return ""
+	}
+	id := RequestID(req.Ctx)
+	if id != "" && Marks.Held(id) {
+		return fmt.Sprintf("held: it would unload %s; Release or Go next lets it", strings.Join(evict, ", "))
+	}
+	sl, ok := s.planner.(StaysLoaded)
+	if !ok || (id != "" && Marks.Forced(id)) {
+		return ""
+	}
+	for _, m := range evict {
+		if stay, left := sl.StaysLoaded(m); stay {
+			return fmt.Sprintf("waits for %s: it was used moments ago and stays loaded %.0f s more for its next prompt (Go next unloads it now)", m, left)
+		}
+	}
+	return ""
+}
+
+// OnTick rechecks the queue: a hold released, or a model's stay-loaded time
+// run out, frees requests without any other event to wake them.
+func (s *FIFO) OnTick() {
+	if len(s.queued) > 0 {
+		s.drainQueue()
+	}
 }
 
 // Status implements Reporter.

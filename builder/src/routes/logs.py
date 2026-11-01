@@ -119,6 +119,26 @@ def request_next(inflight_id):
     return ok()
 
 
+@bp.post("/api/requests/<inflight_id>/<action>")
+def request_action(inflight_id, action):
+    """Cancel a request, or hold or release one waiting for a model to load (Schedule -> Live)."""
+    from ..integrations import engine_api
+    if action not in ("cancel", "hold", "release"):
+        return err("action is cancel, hold or release", 404)
+    url = ctx().settings.get("integrations")["engine_url"]
+    if not url:
+        return err("the engine is not running")
+    try:
+        if action == "cancel":
+            engine_api.request_cancel(url, inflight_id)
+        else:
+            engine_api.request_hold(url, inflight_id, action == "hold")
+    except Exception as exc:  # noqa: BLE001
+        code = getattr(exc, "code", 0)
+        return err("that request is not running any more" if code == 404 else f"the engine refused: {exc}", 404 if code == 404 else 502)
+    return ok()
+
+
 @bp.get("/api/requests")
 def requests_list():
     a = request.args

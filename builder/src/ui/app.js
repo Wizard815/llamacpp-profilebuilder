@@ -4861,7 +4861,7 @@ async function loadSchedule() {
 }
 function syncPlanForm() {
   const p = SC.data.plan;
-  SC.plan = { enabled: p.enabled, cards: p.cards.join(", "), reserve_gib: p.reserve_gib, protect_seconds: p.protect_seconds,
+  SC.plan = { enabled: p.enabled, cards: p.cards.join(", "), reserve_gib: p.reserve_gib, protect_seconds: p.protect_seconds, protect_waits: p.protect_waits !== false,
     placement: p.placement, idle_unload_min: p.idle_unload_min ?? 30,
     answer_first_min_tokens: p.answer_first_min_tokens ?? 4000, answer_first_max_wait_s: p.answer_first_max_wait_s ?? 300,
     share_guard: !!p.share_guard, share_guard_slowdown: p.share_guard_slowdown ?? 50, share_guard_max_wait_s: p.share_guard_max_wait_s ?? 120 };
@@ -4913,6 +4913,26 @@ const bytesShort = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${num(b / 1024, 
 setInterval(() => {
   for (const el of document.querySelectorAll("[data-run-start]")) el.textContent = runClock(Date.now() - Number(el.dataset.runStart));
 }, 500);
+/** What a person can do to a running request: cancel it; hold one still waiting (so it unloads nothing) or release
+ *  it; send a waiting one on now (Go next: past a hold, the one-at-a-time line or a protected model). */
+function reqActions(r, working) {
+  const act = (action, done) => async (e) => {
+    e.target.disabled = true;
+    try { await api("POST", `/api/requests/${encodeURIComponent(r.id)}/${action}`); toast(done, "ok"); loadLive(); }
+    catch (err) { e.target.disabled = false; fail(err); }
+  };
+  const held = /^held/.test(r.held || "");
+  const b = (label, title, run, cls = "ghost") => h("button", { class: `btn sm ${cls}`, style: "margin-left:6px", title, onclick: run }, label);
+  return h("span", { class: "nowrap" },
+    r.held ? b("Go next", "Send it now: to the front of the line, past a hold, or past a model that is only protected (that model unloads)", act("next", "It goes next.")) : null,
+    !working ? (held ? b("Release", "Let it go on as it would have: it may unload a model that is idle", act("release", "Released."))
+      : b("Hold", "Keep it waiting: it will not make any model unload. A loaded model with room still serves it.", act("hold", "Held: it will not unload anything."))) : null,
+    b("Cancel", "Stop this request: the client gets an error, and the model stops working on it", async (e) => {
+      if (!(await confirmBox(`Cancel this ${r.model || ""} request? The client (${r.src || "?"}) gets an error.`, "Cancel request"))) return;
+      act("cancel", "Cancelled.")(e);
+    }, "danger"));
+}
+
 // how many finished requests the Requests card lists (0: only the ones running); remembered per browser
 const REQ_SHOW = [[0, "running only"], [5, "5"], [10, "10"], [25, "25"], [50, "50"], [100, "100"]];
 const reqShow = () => { try { const v = localStorage.getItem("argos.requests.show"); return v == null ? 25 : Number(v); } catch (e) { return 25; } };
@@ -4941,7 +4961,8 @@ function requestsCard(rows, inFlight, opts = {}) {
     ? [s.total ? `prefill ${pct(s.progress)}` : "prefill", `slot ${s.id} is reading this prompt${s.total ? `: ${num(s.tokens, 0)} of ${num(s.total, 0)} tokens at ${num(s.tokens_per_second, 0)} t/s` : ""}`]
     : [`generating${s.generated ? ` ${num(s.generated, 0)}` : ""}`, `slot ${s.id} is writing the answer: ${num(s.generated || 0, 0)} tokens so far, ${num(s.gen_tokens_per_second || 0, 1)} t/s now`]);
   const status = (r) => {
-    if (r.held) return ["held", r.held];
+    // the engine says why a request waits: held by a person, or queued for a model to load or a protected one
+    if (r.held) return [/^held/.test(r.held) ? "held" : "waiting", r.held];
     const s = slotFor[r.id];
     if (s) return slotLabel(s);
     if (r.resp_bytes) return ["generating", "sending its answer"];
@@ -4968,8 +4989,7 @@ function requestsCard(rows, inFlight, opts = {}) {
     h("td", { class: "num", "data-run-start": String(Date.now() - (r.elapsed_ms || 0)) }, runClock(r.elapsed_ms || 0)),
     h("td", { class: "nowrap" }, (([label, why]) => h("span", { class: `pill ${label === "waiting" || label === "held" ? "" : "warn"}`, title: why }, label))(status(r)),
       slotFor[r.id] ? h("span", { class: "muted mono-sm", style: "margin-left:6px" }, `slot ${slotFor[r.id].id}`) : null,
-      r.held ? h("button", { class: "btn sm ghost", style: "margin-left:6px", title: "send this one first: to the front of the line, or past the answer-first hold",
-        onclick: async () => { try { await api("POST", `/api/requests/${encodeURIComponent(r.id)}/next`); toast("It goes next.", "ok"); } catch (e) { fail(e); } } }, "Go next") : null)));
+      reqActions(r, !!slotFor[r.id]))));
   live.push(...orphanRows);
   const table = rows.length || live.length ? h("div", { class: "table-wrap" }, h("table", { class: "dense" },
     h("thead", {}, h("tr", {}, ["When", "Model", "Kind", "From", "Context in", "Out", "Prompt t/s", "Gen t/s", "Time", "Status"]
@@ -5093,7 +5113,7 @@ function renderLive() {
     { label: "Load time", num: true, cell: (m) => (m.load_seconds ? `${num(m.load_seconds, 0)}s` : DASH) },
     { label: "", cell: (m) => h("div", { class: "chips" }, m.persistent && h("span", { class: "chip" }, "kept loaded"),
       m.one_at_a_time && h("span", { class: "chip", title: "one request at a time; the rest wait in Argos, in order" }, "one at a time"),
-      m.answer_first && h("span", { class: "chip", title: "a long new prompt waits while another chat on this model is answering" }, "answer first"), m.protected && h("span", { class: "chip", title: `Used in the last ${span(P.protect_seconds)}, so it is evicted last when another model needs room. Not a setting: it ends on its own once the model sits idle.` }, "recently used")) },
+      m.answer_first && h("span", { class: "chip", title: "a long new prompt waits while another chat on this model is answering" }, "answer first"), m.protected && h("span", { class: "chip", title: `Used in the last ${span(P.protect_seconds)}: ${P.protect_waits === false ? "it is evicted last when another model needs room" : "it stays loaded, and a request for another model that needs its room waits (Go next sends it anyway)"}. Ends on its own once the model sits idle that long.` }, "recently used")) },
     { label: "", cell: (m) => { const b = h("button", { class: "icon-btn ghost", title: "Load, unload, keep loaded, logs, edit", "aria-label": `Actions for ${m.id}` }, "⋯");
       b.addEventListener("click", () => liveMenu(b, m)); return h("td", { class: "actions" }, b); } },
   ], rows, { key: null }, "No models.");
@@ -5113,7 +5133,7 @@ function renderLive() {
   fill(el,
     h("div", { class: "status-line" }, h("span", { class: "pill ok" }, "pool router"),
       h("span", { class: `pill ${P.placement ? "ok" : "warn"}`, title: P.placement ? "each model is placed on a card" : "no per-card sizes: planning by total VRAM" }, P.placement ? "placement on" : "placement off"),
-      h("span", { class: "muted" }, `${num(P.budget_gib)} GiB usable · models used in the last ${span(P.protect_seconds)} are evicted last`),
+      h("span", { class: "muted" }, `${num(P.budget_gib)} GiB usable · models used in the last ${span(P.protect_seconds)} ${(SC.data && SC.data.plan && SC.data.plan.protect_waits === false) ? "are evicted last" : "stay loaded; other models' requests wait"}`),
       h("span", { class: "spacer" }), h("span", { class: "hint", style: "margin:0" }, `updated ${ago(L.at)}`)),
     cardBars(cards, usage, L.real_gib),
     h("p", { class: "hint", style: "margin:-4px 0 12px" }, "Bars are the planned sizes the scheduler fits models by; “in use” is what the GPU reports. After a model loads once, Argos measures its real size and the plan uses that."),
@@ -5211,7 +5231,11 @@ This profile cannot start until its --model path is fixed (open it in Builder).`
         field("Share guard: longest wait (s)", "share_guard_max_wait_s", { type: "number", step: "30", min: "1" }, "then the request goes anyway"),
         field("Answer first: prompts from (tokens)", "answer_first_min_tokens", { type: "number", step: "500", min: "1" }, "a shorter new prompt goes straight in"),
         field("Answer first: longest wait (s)", "answer_first_max_wait_s", { type: "number", step: "30", min: "1" }, "then it goes anyway"),
-        field("Protect (seconds)", "protect_seconds", { type: "number", step: "30", min: "0" }, "a model used this recently is evicted last"),
+        field("Protect (seconds)", "protect_seconds", { type: "number", step: "30", min: "0" }, P.protect_waits ? "a model used this recently stays loaded" : "a model used this recently is evicted last"),
+        (() => { const c = h("input", { type: "checkbox", checked: P.protect_waits });
+          c.addEventListener("change", () => { P.protect_waits = c.checked; touch(); renderPlan(); });
+          return h("label", { class: "check wide", title: "Off: protection only decides which model goes first, and a request for another model unloads a protected one the moment it is idle" },
+            c, "Protected models stay loaded: a request for another model waits instead of unloading one used within Protect (Go next on Live sends it anyway)"); })(),
         field("Unload after (min)", "idle_unload_min", { type: "number", step: "5", min: "0" }, "a model unused this long is unloaded; 0 = never"),
         h("label", { class: "field wide" }, h("span", {}, "Placement"), placement)),
       useDetected && h("div", { class: "row", style: "margin-top:8px" }, useDetected)),

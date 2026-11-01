@@ -3,7 +3,7 @@ title: VRAM-aware pool router
 summary: Put every model in one pool so models load side by side while VRAM fits, and only the cheapest idle model is evicted when it does not.
 category: guides
 tags: [routing, pool, vram, eviction, swap, gpu, memory, persistent]
-config_keys: [routing, models.*.vram, routing.router.settings.pool.answerFirst, routing.router.settings.pool.oneAtATime, routing.router.settings.pool.shareGuard, routing.router.settings.pool.cpuFallback]
+config_keys: [routing, models.*.vram, routing.router.settings.pool.protectWaits, routing.router.settings.pool.answerFirst, routing.router.settings.pool.oneAtATime, routing.router.settings.pool.shareGuard, routing.router.settings.pool.cpuFallback]
 updated: 2026-10-25
 ---
 
@@ -45,6 +45,31 @@ routing:
 3. Models are taken in that order until the new one fits. Any that turn out
    not to be needed are put back.
 4. `persistent` models are never evicted for another model.
+5. A model used in the last `protectSeconds` stays loaded (`protectWaits`,
+   on by default): a request for another model that needs its room waits
+   instead of unloading it. Without this, an agent such as Hermes lost its
+   model between two prompts: the moment the model went idle, a queued
+   request for another model unloaded it, and the next prompt reloaded it
+   from scratch, prompt cache and all.
+
+## Waiting requests: Hold, Go next, Cancel
+
+A request that waits says why on Schedule -> Live: held, waiting for room
+(the model it needs is busy), or waiting for a protected model. Each running
+request has buttons:
+
+- **Hold** keeps a waiting request from unloading anything until
+  **Release**. A model already loaded with room still serves it.
+- **Go next** sends it now, past a hold, the one-at-a-time line or a
+  protected model (which then unloads).
+- **Cancel** stops it: the client gets an error and the model stops working
+  on it.
+
+With `protectWaits` on, a request for another model can wait up to
+`protectSeconds` after the protected model's last request, so keep that
+window near how long your clients pause between prompts (a tool call, a
+human reading the answer). `protectWaits: false` brings back the old
+behaviour, where protection only orders evictions.
 
 ## Per-card placement
 

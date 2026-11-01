@@ -762,6 +762,11 @@ routing:
         # when nothing else can make room
         # - optional, default: 600
         protectSeconds: 600
+        # protectWaits: a model used within protectSeconds stays loaded; a
+        # request for another model that needs its room waits instead of
+        # unloading it (Go next on Schedule -> Live sends it anyway).
+        # false: protection only orders evictions. Default true.
+        protectWaits: true
 
         # persistent: models never evicted to make room for another model
         # - optional, default: empty list

@@ -124,9 +124,19 @@ func (b *baseRouter) notifyProcessed() {
 
 func (b *baseRouter) run() {
 	defer close(b.runDone)
+	// once a second the queue is looked at again: a request a person released,
+	// or a model whose protect time ran out, frees a waiting request with no
+	// other event to wake it
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
 
 	for {
 		select {
+		case <-tick.C:
+			if t, ok := b.schedule.(interface{ OnTick() }); ok {
+				t.OnTick()
+			}
+
 		case req := <-b.shutdownCh:
 			b.handleShutdown(req)
 			return

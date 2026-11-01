@@ -294,6 +294,13 @@ type PoolConfig struct {
 	// room. Default 600.
 	ProtectSeconds int `yaml:"protectSeconds"`
 
+	// ProtectWaits makes the protection hold: a request for another model
+	// waits rather than unload a model used within ProtectSeconds, so a chat
+	// or agent that pauses between prompts does not lose its model (and its
+	// prompt cache) to a reload. Go next on Schedule -> Live sends a waiting
+	// request on anyway. Default true; false only orders evictions.
+	ProtectWaits *bool `yaml:"protectWaits"`
+
 	// Persistent lists models that are never evicted to make room for another
 	// model. They still stop on TTL, unload or shutdown.
 	Persistent []string `yaml:"persistent"`

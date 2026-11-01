@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wizard815/Argos/internal/chain"
 	"github.com/Wizard815/Argos/internal/router"
+	"github.com/Wizard815/Argos/internal/router/scheduler"
 	"github.com/Wizard815/Argos/internal/swaputil"
 	"github.com/tidwall/gjson"
 )
@@ -405,11 +406,46 @@ func CreateAnswerFirstMiddleware(s *Server) chain.Middleware {
 	}
 }
 
+// handleAPIInflightHold holds a request (POST .../hold) so it never makes a
+// model unload, or lets it go on as before (DELETE .../hold).
+func (s *Server) handleAPIInflightHold(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.inflightHas(id) {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no such request running")
+		return
+	}
+	if r.Method == http.MethodDelete {
+		scheduler.Marks.Release(id)
+		s.inflight.SetHeld(id, "")
+	} else {
+		scheduler.Marks.Hold(id)
+		s.inflight.SetHeld(id, "held: it will not make any model unload; Release or Go next lets it")
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "ok"})
+}
+
+func (s *Server) inflightHas(id string) bool {
+	for _, e := range s.inflight.Current().Requests {
+		if e.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // handleAPIInflightNext sends a waiting request on first (Schedule -> Live):
 // to the front of its model's one-at-a-time queue, or out of its
 // answer-first hold.
 func (s *Server) handleAPIInflightNext(w http.ResponseWriter, r *http.Request) {
-	if s.gate == nil || !s.gate.next(r.PathValue("id")) {
+	id := r.PathValue("id")
+	gated := s.gate != nil && s.gate.next(id)
+	// in the scheduler's queue: past a hold, and past a model that is only protected
+	queued := s.inflightHas(id)
+	if queued {
+		scheduler.Marks.Force(id)
+	}
+	if !gated && !queued {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "that request is not waiting")
 		return
 	}

@@ -853,6 +853,11 @@
                                             "default": 600,
                                             "description": "A model used within this many seconds is evicted only when nothing else can make room. 0 uses the default of 600."
                                         },
+                                        "protectWaits": {
+                                            "type": "boolean",
+                                            "default": true,
+                                            "description": "A request for another model waits rather than unload a model used within protectSeconds (Go next on Schedule -> Live sends it on). false: protection only orders evictions."
+                                        },
                                         "persistent": {
                                             "type": "array",
                                             "items": {

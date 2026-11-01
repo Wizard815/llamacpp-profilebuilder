@@ -12,6 +12,7 @@ import (
 	"github.com/Wizard815/Argos/internal/logmon"
 	"github.com/Wizard815/Argos/internal/process"
 	"github.com/Wizard815/Argos/internal/swaputil"
+	"github.com/stretchr/testify/assert"
 )
 
 // FIFO methods all run on the router's single run-loop goroutine, so these
@@ -1145,4 +1146,60 @@ func TestFIFO_StatusReportsQueueSwapsAndInFlight(t *testing.T) {
 	if st.InFlight["a"] != 1 || len(st.Swaps) != 0 {
 		t.Fatalf("after swap: inFlight=%v swaps=%+v want a in flight and no swaps", st.InFlight, st.Swaps)
 	}
+}
+
+// stayingPlanner reports some models as staying loaded (used moments ago).
+type stayingPlanner struct {
+	stubPlanner
+	staying map[string]bool
+}
+
+func (s *stayingPlanner) StaysLoaded(model string) (bool, float64) { return s.staying[model], 42 }
+
+func reqID(model, id string) HandlerReq {
+	r := reqCh(model)
+	r.Ctx = WithRequestID(context.Background(), id)
+	return r
+}
+
+// A chat's model that just answered is not unloaded for another model: the
+// other request waits, says why, and goes once the model's protect time runs
+// out or a person sends it on.
+func TestFIFO_AProtectedModelStaysForItsNextPrompt(t *testing.T) {
+	notes := map[string]string{}
+	Marks.SetNote(func(id, why string) { notes[id] = why })
+	t.Cleanup(func() { Marks.SetNote(nil); Marks.Forget("7"); Marks.Forget("8") })
+
+	eff := newFakeEffects()
+	eff.states["coder"] = process.StateReady
+	eff.states["small"] = process.StateStopped
+	pl := &stayingPlanner{stubPlanner: stubPlanner{evict: map[string][]string{"small": {"coder"}}}, staying: map[string]bool{"coder": true}}
+	s := newFIFO(pl, eff)
+
+	s.OnRequest(reqID("small", "7"))
+	assert.Equal(t, 0, eff.startsFor("small"), "the coder was used moments ago: it stays")
+	assert.Contains(t, notes["7"], "stays loaded 42 s more")
+	s.OnRequest(req("coder"))
+	assert.Equal(t, 1, eff.served("coder"), "its own next prompt is served at once")
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "coder"})
+	s.OnTick()
+	assert.Equal(t, 0, eff.startsFor("small"), "still within its protect time")
+
+	Marks.Force("7") // Go next
+	s.OnTick()
+	assert.Equal(t, 1, eff.startsFor("small"))
+	assert.Equal(t, "", notes["7"], "the note goes once it starts")
+
+	// held: waits even with the coder no longer protected, until released
+	pl.staying["coder"] = false
+	eff.states["small"] = process.StateStopped
+	Marks.Hold("8")
+	s2 := newFIFO(pl, eff)
+	s2.OnRequest(reqID("small", "8"))
+	assert.Equal(t, 1, eff.startsFor("small"), "held: no new swap")
+	assert.Contains(t, notes["8"], "held")
+	Marks.Release("8")
+	s2.OnTick()
+	assert.Equal(t, 2, eff.startsFor("small"))
 }

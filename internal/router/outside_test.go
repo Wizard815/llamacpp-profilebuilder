@@ -3,6 +3,7 @@ package router
 import (
 	"io"
 	"testing"
+	"time"
 
 	"github.com/Wizard815/Argos/internal/config"
 	"github.com/Wizard815/Argos/internal/logmon"
@@ -94,4 +95,34 @@ func TestPool_OutsideVRAMReadsTheEnginesOwnGPUReadingFirst(t *testing.T) {
 	require.NotNil(t, st.Cards[0].OtherGiB)
 	assert.InDelta(t, 19.8, *st.Cards[0].OtherGiB, 0.001)
 	assert.InDelta(t, 12.2, st.Cards[0].FreeGiB, 0.001, "31 less the 18.8 the reserve does not cover")
+}
+
+// Protect holds by default: a model used within protectSeconds stays for its
+// next prompt; protectWaits: false only orders evictions, as before.
+func TestPool_AProtectedModelStaysLoaded(t *testing.T) {
+	conf := config.Config{Models: map[string]config.ModelConfig{"a": {VRAM: 10}}}
+	conf.Routing.Router.Settings.Pool = config.PoolConfig{VRAMGiB: 64, ProtectSeconds: 600, Placement: "off"}
+	p := newPoolSwapper(conf, logmon.NewWriter(io.Discard), nil)
+	now := time.Unix(10000, 0)
+	p.now = func() time.Time { return now }
+
+	stay, _ := p.StaysLoaded("a")
+	assert.False(t, stay, "never used")
+	p.OnServeStart("a")
+	now = now.Add(5 * time.Minute)
+	p.OnServeDone("a")
+	now = now.Add(time.Minute)
+	stay, left := p.StaysLoaded("a")
+	assert.True(t, stay)
+	assert.InDelta(t, 540, left, 0.1, "counted from the end of its last request")
+	now = now.Add(10 * time.Minute)
+	stay, _ = p.StaysLoaded("a")
+	assert.False(t, stay)
+
+	off := false
+	conf.Routing.Router.Settings.Pool.ProtectWaits = &off
+	q := newPoolSwapper(conf, logmon.NewWriter(io.Discard), nil)
+	q.OnServeDone("a")
+	stay, _ = q.StaysLoaded("a")
+	assert.False(t, stay)
 }

@@ -31,6 +31,7 @@ DEFAULT_PLAN: dict[str, Any] = {
     "cards": [],             # GiB per GPU, numbered from 0; [] lets the engine detect them
     "reserve_gib": 2.0,      # kept free for KV growth and buffers
     "protect_seconds": 600,  # a model used this recently is evicted last
+    "protect_waits": True,   # ...and is not unloaded for another model at all: that request waits (Go next sends it)
     "placement": "auto",     # auto | off
     "persistent": [],        # model ids that are never evicted to make room
     # model ids where a long new prompt waits while another chat on the model is answering, so the answer keeps
@@ -153,7 +154,7 @@ def clean_plan(values: dict) -> dict:
     for key, v in values.items():
         if key not in DEFAULT_PLAN:
             raise PlanError(f"unknown schedule setting {key!r}")
-        if key in ("enabled", "share_guard"):
+        if key in ("enabled", "share_guard", "protect_waits"):
             out[key] = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
         elif key == "cards":
             if isinstance(v, str):
@@ -356,6 +357,7 @@ def render_fragment(plan: dict, sizes: Optional[dict[str, float]] = None,
         pool["cards"] = [round(c, 3) for c in plan["cards"]]
     pool["reserveGiB"] = plan["reserve_gib"]
     pool["protectSeconds"] = plan["protect_seconds"]
+    pool["protectWaits"] = bool(plan.get("protect_waits", True))
     pool["placement"] = plan["placement"]
     persistent = [m for m in plan["persistent"] if keep(m)]
     if persistent:

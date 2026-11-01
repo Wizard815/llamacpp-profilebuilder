@@ -135,7 +135,7 @@ def test_fragment_is_the_routing_block_engine_reads():
     doc = yaml.safe_load(text)
     pool = doc["routing"]["router"]["settings"]["pool"]
     assert doc["routing"]["router"]["use"] == "pool" and skipped == []
-    assert pool == {"cards": [32.0, 32.0], "reserveGiB": 2.0, "protectSeconds": 300, "placement": "auto",
+    assert pool == {"cards": [32.0, 32.0], "reserveGiB": 2.0, "protectSeconds": 300, "protectWaits": True, "placement": "auto",
                     "persistent": ["whisper"], "sizes": {"a": 26.0, "whisper": 4.0}}
     assert text.startswith("# Written by Argos")
 
@@ -331,3 +331,9 @@ def test_custom_cache_types_are_bits_per_value_and_override_the_table():
         assert known["kv_gib"] < estimate_gib(0, ARCH, 4096, "q8_0", "q8_0")["kv_gib"]
     finally:
         S.set_custom_cache_types("")
+
+
+def test_protected_models_stay_loaded_unless_turned_off():
+    from src.scheduler import DEFAULT_PLAN, clean_plan
+    assert DEFAULT_PLAN["protect_waits"] is True
+    assert clean_plan({"protect_waits": "false"})["protect_waits"] is False

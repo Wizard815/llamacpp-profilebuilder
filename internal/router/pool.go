@@ -167,7 +167,10 @@ type poolSwapper struct {
 
 	busy     map[string]int
 	lastUsed map[string]time.Time
-	loadTime map[string]time.Duration
+	// protectWaits: a model used within protect is not unloaded for another
+	// model's request; that request waits (scheduler.StaysLoaded)
+	protectWaits bool
+	loadTime     map[string]time.Duration
 
 	now func() time.Time
 }
@@ -228,6 +231,7 @@ func newPoolSwapper(conf config.Config, logger *logmon.Monitor, detect func() ([
 		loadTime:    make(map[string]time.Duration),
 		now:         time.Now,
 	}
+	p.protectWaits = pc.ProtectWaits == nil || *pc.ProtectWaits
 	if pc.Placement != "off" {
 		for _, c := range cards {
 			p.cards = append(p.cards, poolCard{id: c.ID, cap: max(c.TotalGiB-pc.ReserveGiB/float64(len(cards)), 0)})
@@ -707,6 +711,27 @@ func (p *poolSwapper) OnServeStart(id string) {
 	defer p.mu.Unlock()
 	p.busy[id]++
 	p.lastUsed[id] = p.now()
+}
+
+// StaysLoaded implements scheduler.StaysLoaded: a model used within the
+// protect window stays for its next prompt instead of being unloaded for
+// another model, when protectWaits is on. Persistent models never get here
+// (they are not evicted at all).
+func (p *poolSwapper) StaysLoaded(id string) (bool, float64) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.protectWaits || p.protect <= 0 {
+		return false, 0
+	}
+	t, ok := p.lastUsed[id]
+	if !ok {
+		return false, 0
+	}
+	left := p.protect - p.now().Sub(t)
+	if left <= 0 {
+		return false, 0
+	}
+	return true, left.Seconds()
 }
 
 // OnServeDone implements scheduler.UsageObserver.

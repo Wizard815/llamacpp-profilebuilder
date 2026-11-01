@@ -77,6 +77,19 @@ def request_next(base_url: str, inflight_id: str, timeout: float = 5.0) -> None:
     _post(base_url.rstrip("/") + f"/api/inflight/{urllib.parse.quote(inflight_id, safe='')}/next", timeout)
 
 
+def request_cancel(base_url: str, inflight_id: str, timeout: float = 5.0) -> None:
+    """Cancel a running or waiting request: the client gets an error, the model stops working on it."""
+    _post(base_url.rstrip("/") + f"/api/inflight/{urllib.parse.quote(inflight_id, safe='')}/cancel", timeout)
+
+
+def request_hold(base_url: str, inflight_id: str, hold: bool, timeout: float = 5.0) -> None:
+    """Hold a waiting request so it makes no model unload, or let it go on (hold False)."""
+    req = urllib.request.Request(base_url.rstrip("/") + f"/api/inflight/{urllib.parse.quote(inflight_id, safe='')}/hold",
+                                 data=b"", method="POST" if hold else "DELETE")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        resp.read()
+
+
 def clear_crashes(base_url: str, model_id: str, timeout: float = 5.0) -> None:
     """Forget a model's crashes, so the engine starts it again on a request. An older engine has none to forget."""
     try:
