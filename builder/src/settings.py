@@ -46,6 +46,7 @@ def env_defaults(cfg: dict) -> dict:
             "enabled": True,
             "endpoint": "",   # blank = the engine's /v1 (another OpenAI-compatible server only if you need one)
             "model": "",      # an embedding model id, e.g. nomic-embed-text-v2-q8; blank = search by words only
+            "model_cpu": "",  # its CPU alternative for when the GPUs are full: best another profile of the same model
             "batch": 16,
             "results": 8,     # records the assistant sees per question
         },
@@ -118,6 +119,13 @@ def env_defaults(cfg: dict) -> dict:
             "cpu_fallback": True,
             "quant": "Q8_0",         # what to download the assistant's own model at
             "escalate_model": "",    # a bigger model for questions beyond the small one; empty = it answers everything
+            # each model may have a CPU alternative, used when the GPU one would have to wait for VRAM or unload
+            # something (model_choice): blank = the GPU one always
+            "model_cpu": "",
+            "escalate_model_cpu": "",
+            # a hard question goes to a bigger chat model that is already loaded and idle (the coder between
+            # prompts, say) before loading the escalation model: no load, nothing unloaded
+            "escalate_to_loaded": True,
             "escalate_quant": "Q4_K_M",  # what to download that one at: it may run on CPU, where smaller is faster
         },
     }

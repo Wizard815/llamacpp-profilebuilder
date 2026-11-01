@@ -74,6 +74,24 @@ NEEDS_BIG = re.compile(
     r"recommend|suggest|should i|advice|best (settings?|profile|config|way)|compare|comparison|versus|vs\.?|difference|"
     r"explain|how (do|can|should|would) i|tune|tuning|optimi[sz]e|improve|similar|trend|over time)\b", re.I)
 
+_NUM_UNIT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(t/s|tokens? per second|tok/s|GiB|GB|MiB|MB|%|°C|W\b)", re.I)
+_NUM = re.compile(r"\d+(?:\.\d+)?")
+
+
+def unsupported_numbers(answer: str, data: str) -> list[str]:
+    """Speeds, sizes, shares and temperatures in an answer that appear nowhere in the data it was given (a small
+    model reporting its own speed, or making one up). Rounding is allowed: 79 for 79.04, 1.2 for 1.25."""
+    have = [float(x) for x in _NUM.findall(data or "")]
+    out = []
+    for m in _NUM_UNIT.finditer(answer or ""):
+        v = float(m.group(1).replace(",", ""))
+        if v <= 1:
+            continue
+        if not any(abs(v - d) <= max(0.06, 0.012 * d) for d in have):
+            out.append(f"{m.group(1)} {m.group(2)}")
+    return out
+
+
 # How many models one question may pull into focus. Two was tight: a question
 # that compares three setups silently lost the third.
 FOCUS_MODELS = 4
@@ -185,6 +203,7 @@ class Assistant:
         self._turn = threading.Lock()
         self.last_used = 0.0  # when the chat model last answered, for unloading it when idle
         self._escalated = False  # this turn is being answered by the escalation model
+        self._big = ""  # the bigger model this turn goes to (bigger_model)
         self._builder: Optional[dict] = None  # what is on screen this turn, for digest()
 
     # ----- the facts the model sees ----------------------------------------
@@ -328,7 +347,7 @@ class Assistant:
                 "engine_url": self.settings.get("integrations").get("engine_url") or "",
                 "runners": self.runners, "runner_models": runner_models,
                 # the assistant's own chat and memory models: never the answer to "what is running"
-                "own_models": {x for x in (self.settings.get("assistant").get("model"), self.settings.get("memory").get("model")) if x}}
+                "own_models": {x for role in ("chat", "escalate", "embed") for x in self.role_models(role) if x}}
 
     def _direct(self, question: str) -> Optional[str]:
         if self.inventory is None:
@@ -488,10 +507,10 @@ class Assistant:
                 raise AssistantError("Pick a model for the assistant under Assistant → Settings, or click “Set up Qwen3-0.6B”.")
             if not url:
                 raise AssistantError("The engine is not running, so the assistant's model cannot be loaded.")
-            # A turn the small model handed over, or one the user sent straight up.
-            if self._escalated and self.escalate_model():
-                return url.rstrip("/") + "/v1", self.escalate_model()
-            return url.rstrip("/") + "/v1", cfg["model"]
+            # A turn the small model handed over, or one the user sent straight up: the bigger model chosen for it
+            if self._escalated and (self._big or self.escalate_model()):
+                return url.rstrip("/") + "/v1", self._big or self.escalate_model()
+            return url.rstrip("/") + "/v1", self.pick("chat")
         if cfg["mode"] == "endpoint":
             if not cfg["endpoint"]:
                 raise AssistantError("Set the assistant endpoint under Assistant → Settings, or switch it to a model the engine has.")
@@ -629,7 +648,7 @@ class Assistant:
             return out
 
         if cfg["mode"] == "engine":
-            chat = in_engine(cfg["model"], self.last_used)
+            chat = in_engine(self.pick("chat"), self.last_used)
         elif cfg["mode"] == "endpoint":
             chat = {"model": cfg["model"], "where": cfg["endpoint"], "controllable": False, "state": "unknown",
                     "last_used": self.last_used or None}
@@ -644,7 +663,7 @@ class Assistant:
         elif mem.get("endpoint"):
             embed = {"model": mem["model"], "where": mem["endpoint"], "controllable": False, "state": "unknown", "last_used": last_embed or None}
         else:
-            embed = in_engine(mem["model"], last_embed)
+            embed = in_engine(self.pick("embed"), last_embed)
         return {"chat": chat, "embed": embed, "idle_unload_min": int(cfg.get("idle_unload_min") or 0)}
 
     def load(self, which: str) -> dict:
@@ -702,7 +721,7 @@ class Assistant:
         or fallen back to the CPU now. Then embedding takes nothing from the models on the GPUs, so the memory
         embeds as records come in instead of waiting for a search. Rechecked once a minute."""
         now = time.time()
-        model = str(self.settings.get("memory").get("model") or "")
+        model = self.pick("embed")
         cached = getattr(self, "_embed_cpu", None)
         if cached and cached[0] == model and now - cached[1] < 60:
             return cached[2]
@@ -720,14 +739,102 @@ class Assistant:
         return on
 
     def escalate_model(self) -> str:
-        """The bigger model a hard question goes to, or "" when there is none."""
-        return str(self.settings.get("assistant").get("escalate_model") or "").strip()
+        """The bigger model a hard question goes to (GPU or CPU, see pick), or "" when there is none."""
+        return self.pick("escalate")
 
-    def _ask_bigger(self, digest: str, question: str) -> str:
-        """Put the same question to the escalation model, with the same context."""
-        base, model = self.endpoint()
-        return self._complete(base, model, [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + digest},
-                                            {"role": "user", "content": question}], ANSWER_TOKENS)
+    ROLES = {"chat": ("assistant", "model", "model_cpu"), "escalate": ("assistant", "escalate_model", "escalate_model_cpu"),
+             "embed": ("memory", "model", "model_cpu")}
+
+    def role_models(self, role: str) -> tuple[str, str]:
+        """(GPU model, CPU model) set for a role: chat, escalate or embed."""
+        group, gpu, cpu = self.ROLES[role]
+        s = self.settings.get(group)
+        return str(s.get(gpu) or "").strip(), str(s.get(cpu) or "").strip()
+
+    def _pool(self) -> dict:
+        """The engine's /api/pool, at most five seconds old: picks are made often, and it changes slowly."""
+        cached = getattr(self, "_pool_cache", None)
+        if cached and time.time() - cached[0] < 5:
+            return cached[1]
+        pool: dict = {}
+        if self._engine():
+            try:
+                pool = engine_api.pool_state(self._engine(), timeout=2.0) or {}
+            except Exception:  # noqa: BLE001 - no sizes: the GPU model, as before
+                pool = {}
+        self._pool_cache = (time.time(), pool)
+        return pool
+
+    def pick(self, role: str, why: bool = False):
+        """The model a role uses now: its GPU model, or its CPU alternative when the GPU one would have to wait
+        for VRAM or unload something (model_choice). ``why`` returns (model, reason)."""
+        from .model_choice import choose
+        gpu, cpu = self.role_models(role)
+        group = self.ROLES[role][0]
+        engine_served = (self.settings.get("assistant").get("mode") == "engine" if group == "assistant"
+                         else not (self.settings.get("memory").get("endpoint") or "").strip())
+        model, reason = choose(gpu, cpu, self._pool()) if cpu and engine_served else (gpu, "the model set")
+        return (model, reason) if why else model
+
+    def bigger_model(self) -> tuple[str, str]:
+        """(the model a hard question goes to, why that one), or ("", why none can answer now).
+
+        In order: the escalation model (GPU or CPU) when one is loaded; the biggest chat model already loaded and
+        idle (no load, nothing unloaded); the escalation model loaded fresh: the GPU one when it fits in the free
+        VRAM, else its CPU alternative. A load that would have to wait for a busy model, or unload one, is not
+        started for a question.
+        """
+        from .model_choice import choose
+        cfg, url = self.settings.get("assistant"), self._engine()
+        esc_gpu, esc_cpu = self.role_models("escalate")
+        if cfg["mode"] != "engine" or not url:
+            esc = esc_gpu or esc_cpu
+            return (esc, "the escalation model") if esc else ("", "no bigger model is set (Settings → Assistant → Hard questions)")
+        pool = self._pool()
+        models = {m["id"]: m for m in pool.get("models") or [] if m.get("id")}
+        ready = {mid for mid, m in models.items() if m.get("state") == "ready"}
+        if not models:  # not the pool router: what the engine runs
+            try:
+                ready = {m["model"] for m in engine_api.running(url, 2.0) if m.get("state") == "ready"}
+            except Exception:  # noqa: BLE001
+                ready = set()
+        for esc, where in ((esc_gpu, "GPU"), (esc_cpu, "CPU")):
+            if esc and esc in ready:
+                return esc, f"the escalation model ({where}), already loaded"
+        if cfg.get("escalate_to_loaded", True):
+            own = {x for role in ("chat", "embed") for x in self.role_models(role) if x}
+            embedding = re.compile(r"(?i)embed|rerank|(?<![a-z])(bge|e5|gte)-|whisper|kokoro|tts|sd-|flux|diffusion")
+            small = max([(models.get(x) or {}).get("size_gib") or 0 for x in self.role_models("chat")] or [0])
+            idle = [m for mid, m in models.items() if mid in ready and mid not in own and not embedding.search(mid)
+                    and not m.get("in_flight") and not m.get("slots") and (m.get("size_gib") or 0) > max(small * 2, 1.5)]
+            if idle:
+                best = max(idle, key=lambda m: m.get("size_gib") or 0)
+                return best["id"], f"{best['id']}, already loaded and idle"
+        if not esc_gpu and not esc_cpu:
+            return "", "no bigger model is loaded and idle, and none is set (Settings → Assistant → Hard questions)"
+        if esc_gpu and esc_cpu:  # the GPU one when it fits, else the CPU one
+            model, reason = choose(esc_gpu, esc_cpu, pool)
+            return model, f"the escalation model: {reason}"
+        esc = esc_gpu or esc_cpu
+        e = models.get(esc) or {}
+        if esc == esc_cpu or e.get("on_cpu") or self._cpu_only(esc):
+            return esc, "the escalation model, on the CPU"
+        need = e.get("size_gib") or 0
+        free = sum(c.get("free_gib") or 0 for c in pool.get("cards") or [])
+        if not pool.get("cards") or not need or need <= free:
+            return esc, "the escalation model"
+        busy = [mid for mid, m in models.items() if mid in ready and (m.get("in_flight") or m.get("slots"))]
+        return "", (f"{esc} needs {need:.1f} GiB and the GPUs have {free:.1f} GiB free: loading it would "
+                    + (f"wait for {', '.join(busy)}" if busy else "unload a loaded model")
+                    + ". Set a CPU model for hard questions to use one now, or load it by hand")
+
+    def _cpu_only(self, model: str) -> bool:
+        try:
+            launch = engine_api.model_launch(self._engine(), model, timeout=2.0)
+        except Exception:  # noqa: BLE001
+            return False
+        text = " ".join([launch.get("cmd") or ""] + [str(e) for e in launch.get("env") or []])
+        return bool(re.search(r"(HIP|CUDA|ROCR)_VISIBLE_DEVICES=-1\b|(^|\s)(-ngl|--n-gpu-layers|--gpu-layers)[ =]0\b", text))
 
     def unload(self, which: str, reason: str = "") -> dict:
         info = self.models()[which]
@@ -810,7 +917,14 @@ class Assistant:
             self._builder = builder or None
             # The user can send a question straight to the bigger model; one about the past or wanting judgment
             # goes there too. The small model only reads off the live data.
-            self._escalated = bool(self.escalate_model()) and (bool(escalate) or bool(NEEDS_BIG.search(text)))
+            self._escalated, self._big = False, ""
+            if escalate or NEEDS_BIG.search(text):
+                big, why = self.bigger_model()
+                if big:
+                    self._escalated, self._big = True, big
+                    yield {"type": "status", "text": f"Asking {big} ({why})…"}
+                else:
+                    yield {"type": "status", "text": f"No bigger model can answer now: {why}. The small model answers from the live data."}
             # Starting the model can take a while: run it aside and stream its progress.
             updates: queue.Queue = queue.Queue()
             result: dict = {}
@@ -835,7 +949,8 @@ class Assistant:
             base, model = result["endpoint"]
             self.store.add_message("user", text)
             # the memory search (the embedding model) is the bigger model's; with none set up the small one has it
-            digest = self.digest(text, memory=self._escalated or not self.escalate_model())
+            has_bigger = any(self.role_models("escalate"))
+            digest = self.digest(text, memory=self._escalated or not has_bigger)
             if self.compact(base, model, digest):
                 yield {"type": "compacted", "summary": self.summary()}
             answer = ""
@@ -850,17 +965,36 @@ class Assistant:
                 return
             clean, actions = self._actions(answer)
             clean = ESCALATE_RE.sub("", clean).strip()
-            # The small model handed the question over: ask the bigger one, once.
-            if ESCALATE_RE.search(answer or "") and not self._escalated and self.escalate_model():
-                self._escalated = True
-                yield {"type": "status", "text": f"This is beyond the small model — asking {self.escalate_model()}…"}
-                try:
-                    answer = self._ask_bigger(self.digest(text, memory=True), text)
-                except AssistantError as exc:  # noqa: BLE001 - the small answer stands
-                    yield {"type": "status", "text": f"The bigger model could not answer: {exc}"}
+            # The small model handed the question over, or gave numbers Argos never gave it: ask a bigger one, once.
+            made_up = [] if self._escalated else unsupported_numbers(clean, digest)
+            if not self._escalated and (ESCALATE_RE.search(answer or "") or made_up):
+                big, why = self.bigger_model()
+                if big:
+                    self._escalated, self._big = True, big
+                    reason = (f"has numbers that are not in Argos's data ({', '.join(made_up[:3])})" if made_up
+                              else "is beyond it")
+                    yield {"type": "reset"}
+                    yield {"type": "status", "text": f"The small model's answer {reason}: asking {big} ({why})…"}
+                    try:
+                        big_base, big_model = self.endpoint()
+                        big_answer = ""
+                        for piece in self._stream(big_base, big_model, self._prompt(self.digest(text, memory=True))):
+                            big_answer += piece
+                            yield {"type": "delta", "text": piece}
+                    except AssistantError as exc:  # noqa: BLE001 - the small answer stands, said so
+                        yield {"type": "status", "text": f"The bigger model could not answer: {exc}"}
+                    else:
+                        clean, actions = self._actions(big_answer)
+                        clean = ESCALATE_RE.sub("", clean).strip()
+                elif made_up:
+                    note = (f"\n\n(Check this: {', '.join(made_up[:3])} are not in Argos's data, and no bigger model can "
+                            f"answer now: {why}.)")
+                    clean += note
+                    yield {"type": "delta", "text": note}
                 else:
-                    clean, actions = self._actions(answer)
-                    clean = ESCALATE_RE.sub("", clean).strip()
+                    clean = f"The small model cannot answer this, and no bigger model can right now: {why}."
+                    yield {"type": "reset"}
+                    yield {"type": "delta", "text": clean}
             self.store.add_message("assistant", clean or "(no answer)")
             for action in actions:
                 yield {"type": "action", "action": action}

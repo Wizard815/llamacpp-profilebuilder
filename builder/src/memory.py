@@ -76,6 +76,7 @@ class Memory:
         self.last_error = ""
         self.last_used = 0.0  # when the embedding model last answered, for unloading it when idle
         self.extra_sources: list[Callable[[], Iterable[tuple]]] = []  # e.g. Odysseus' Brain
+        self.pick: Optional[Callable[[], str]] = None  # which embedding model to use now (Assistant.pick)
 
     # ----- configuration ---------------------------------------------------------------
     def config(self) -> dict:
@@ -83,7 +84,24 @@ class Memory:
         m = dict(s.get("memory") or {})
         if not m.get("endpoint") and s["integrations"].get("engine_url"):
             m["endpoint"] = s["integrations"]["engine_url"].rstrip("/") + "/v1"
+        if self.pick is not None:  # the GPU model, or its CPU alternative when the GPUs are full
+            try:
+                m["model"] = self.pick() or m.get("model") or ""
+            except Exception:  # noqa: BLE001 - the model set
+                pass
         return m
+
+    def vector_key(self) -> str:
+        """What a vector is filed under: the model, not the profile (<model>--<label>). Two profiles of one
+        embedding model, one on a GPU and one on the CPU, make the same vectors, so switching between them
+        re-embeds nothing."""
+        return (self.config().get("model") or "").split("--", 1)[0]
+
+    def _same_model(self) -> tuple[str, tuple]:
+        """A WHERE fragment matching vectors of this model, under its key or (older ones) a profile of it."""
+        key = self.vector_key()
+        like = key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "--%"
+        return "(model = ? OR model LIKE ? ESCAPE '\\')", (key, like)
 
     def vectors_on(self) -> bool:
         c = self.config()
@@ -195,9 +213,10 @@ class Memory:
 
     def _embed_pending(self, budget: int) -> int:
         c = self.config()
-        model = c["model"]
-        rows = self.store._q("SELECT id, text FROM memory_records WHERE vector IS NULL OR model != ? ORDER BY ts DESC LIMIT ?",
-                             (model, budget))
+        model = self.vector_key()
+        same, args = self._same_model()
+        rows = self.store._q(f"SELECT id, text FROM memory_records WHERE vector IS NULL OR NOT {same} ORDER BY ts DESC LIMIT ?",
+                             (*args, budget))
         done, batch = 0, max(1, int(c.get("batch") or 16))
         for i in range(0, len(rows), batch):
             chunk = rows[i:i + batch]
@@ -282,8 +301,9 @@ class Memory:
         rows = [r for r in self.store._q("SELECT id, source, key, ts, text FROM memory_records") if r["source"] in want and r["id"] != rec["id"]]
         by_id = {r["id"]: r for r in rows}
         sims: list[tuple[int, float]] = []
-        if rec["vector"] is not None and rec["model"] == self.config().get("model"):
-            other = self.store._q("SELECT id, vector FROM memory_records WHERE vector IS NOT NULL AND model=? AND dims=?", (rec["model"], rec["dims"]))
+        same, args = self._same_model()
+        if rec["vector"] is not None and (rec["model"] or "").split("--", 1)[0] == self.vector_key():
+            other = self.store._q(f"SELECT id, vector FROM memory_records WHERE vector IS NOT NULL AND {same} AND dims=?", (*args, rec["dims"]))
             mine = _vec(rec["vector"])
             for r in other:
                 if r["id"] in by_id:
@@ -313,7 +333,8 @@ class Memory:
         model = self.config()["model"]
         qv = array.array("f")
         qv.frombytes(_vec_bytes(self.embed([query])[0]))
-        rows = self.store._q("SELECT id, vector, dims FROM memory_records WHERE vector IS NOT NULL AND model=?", (model,))
+        same, args = self._same_model()
+        rows = self.store._q(f"SELECT id, vector, dims FROM memory_records WHERE vector IS NOT NULL AND {same}", args)
         rows = [r for r in rows if r["id"] in allowed and r["dims"] == len(qv)]
         if not rows:
             return []
@@ -330,8 +351,9 @@ class Memory:
 
     def status(self) -> dict:
         c = self.config()
-        counts = self.store._q("SELECT COUNT(*) AS n, SUM(CASE WHEN vector IS NOT NULL AND model=? THEN 1 ELSE 0 END) AS v, "
-                               "MAX(indexed_at) AS last FROM memory_records", (c.get("model") or "",))[0]
+        same, args = self._same_model()
+        counts = self.store._q(f"SELECT COUNT(*) AS n, SUM(CASE WHEN vector IS NOT NULL AND {same} THEN 1 ELSE 0 END) AS v, "
+                               "MAX(indexed_at) AS last FROM memory_records", args)[0]
         by_source = {r["source"]: r["n"] for r in self.store._q("SELECT source, COUNT(*) AS n FROM memory_records GROUP BY source")}
         return {"records": counts["n"] or 0, "embedded": counts["v"] or 0, "last_indexed": counts["last"],
                 "vectors_on": self.vectors_on(), "endpoint": c.get("endpoint") or "", "model": c.get("model") or "",

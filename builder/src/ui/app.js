@@ -1080,7 +1080,8 @@ async function sendBuilderChat() {
         let ev = {};
         try { ev = JSON.parse(line.slice(6)); } catch (e) { continue; }
         if (ev.actions?.length) answer.actions = ev.actions;
-        if (ev.type === "delta") { answer.content += ev.text || ""; renderBuilderChat(); }
+        if (ev.type === "reset") { answer.content = ""; renderBuilderChat(); }
+        else if (ev.type === "delta") { answer.content += ev.text || ""; renderBuilderChat(); }
         else if (ev.type === "done" && ev.text) answer.content = ev.text;
         else if (ev.type === "error") answer.content = ev.error || "The assistant failed.";
       }
@@ -3611,6 +3612,7 @@ async function sendChat() {
         const ev = JSON.parse(line.slice(5));
         if (ev.type === "status") fill(status, h("span", { class: "dot warn" }), ev.text);
         else if (ev.type === "compacted") toast("Older messages were compacted into a summary.", "");
+        else if (ev.type === "reset") { answer = ""; body.textContent = ""; body.append(status); }  // a bigger model answers instead
         else if (ev.type === "delta") { status.remove(); answer += ev.text; body.textContent = visibleAnswer(answer); bubble.scrollIntoView({ block: "end" }); }
         else if (ev.type === "action") { status.remove(); body.append(actionEl(ev.action)); bubble.scrollIntoView({ block: "end" }); }
         else if (ev.type === "error") { status.remove(); body.append(h("p", { style: "color:var(--danger)" }, ev.error)); }
@@ -3667,12 +3669,17 @@ function renderAssistantSettings() {
   const useOther = h("input", { type: "checkbox", checked: cfg.mode === "endpoint" });
   const endpoint = h("input", { type: "text", value: cfg.endpoint || "", placeholder: "http://other-box:8080/v1", spellcheck: "false" });
   const endpointModel = h("input", { type: "text", value: cfg.mode === "endpoint" ? cfg.model || "" : "", placeholder: "model id on that server", spellcheck: "false" });
-  const syncOther = () => { chat.disabled = useOther.checked; };
+  // each model has a CPU alternative, used when the GPU one would have to wait for VRAM or unload something
+  const cpuNote = "Used when the GPU model would have to wait for VRAM or unload something (a big model loaded). Pick a CPU-only profile (GPUs hidden or -ngl 0). Whichever of the two is already loaded is kept.";
+  const chatCpu = modelSelect(ch.chat, cfg.model_cpu || "", { none: "none: the GPU model always", connected: ch.engine_connected });
+  const syncOther = () => { chat.disabled = useOther.checked; chatCpu.disabled = useOther.checked; };
   useOther.addEventListener("change", syncOther);
   syncOther();
 
   // escalation: what a hard question is handed to
   const escalate = modelSelect(ch.chat, cfg.escalate_model || "", { none: "none: the small model answers everything", connected: ch.engine_connected });
+  const escalateCpu = modelSelect(ch.chat, cfg.escalate_model_cpu || "", { none: "none: the GPU model always", connected: ch.engine_connected });
+  const toLoaded = h("input", { type: "checkbox", checked: cfg.escalate_to_loaded !== false });
   const escalateQuant = h("select", {}, ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"].map((q) => h("option", { value: q }, q)));
   escalateQuant.value = cfg.escalate_quant || "Q4_K_M";
   const escalateFetch = h("button", { class: "btn sm", type: "button" }, "Fetch it");
@@ -3698,21 +3705,23 @@ function renderAssistantSettings() {
   // memory
   const memOn = h("input", { type: "checkbox", checked: !!mem.enabled });
   const embed = modelSelect(ch.embed, mem.model, { none: "none: search by words only", connected: ch.engine_connected });
+  const embedCpu = modelSelect(ch.embed, mem.model_cpu || "", { none: "none: the GPU model always", connected: ch.engine_connected });
   const results = h("input", { type: "number", value: mem.results });
   const memEndpoint = h("input", { type: "text", value: mem.endpoint || "", placeholder: "blank = the engine (normal)", spellcheck: "false" });
 
   const save = async () => {
     try {
       const body = { context_tokens: ctx.value, keep_recent: keep.value, temperature: temp.value, idle_unload_min: idle.value,
-        escalate_model: escalate.value, escalate_quant: escalateQuant.value, cpu_fallback: cpuFallback.checked };
+        escalate_model: escalate.value, escalate_model_cpu: escalateCpu.value, escalate_to_loaded: toLoaded.checked,
+        escalate_quant: escalateQuant.value, cpu_fallback: cpuFallback.checked };
       if (useOther.checked) {
         if (!endpoint.value.trim()) throw new Error("Type the other server's URL, or untick “Use another server”.");
         Object.assign(body, { mode: "endpoint", endpoint: endpoint.value.trim(), model: endpointModel.value.trim() });
       } else {
-        Object.assign(body, { mode: "engine", model: chat.value });
+        Object.assign(body, { mode: "engine", model: chat.value, model_cpu: chatCpu.value });
       }
       await api("PUT", "/api/settings/assistant", body);
-      await api("PUT", "/api/settings/memory", { enabled: memOn.checked, model: embed.value, endpoint: memEndpoint.value.trim(), results: results.value });
+      await api("PUT", "/api/settings/memory", { enabled: memOn.checked, model: embed.value, model_cpu: embedCpu.value, endpoint: memEndpoint.value.trim(), results: results.value });
       await loadSettings();
       toast("Saved the assistant settings.", "ok");
       renderAssistantSettings();
@@ -3728,7 +3737,8 @@ function renderAssistantSettings() {
       h("p", { class: "hint" }, "Any of your models or profiles. The engine loads it on the first message (or with Load on the chat page) and it shares the GPUs like any other model. A small one is plenty: Qwen3-0.6B fits in under 1 GB."),
       engineNote,
       h("div", { class: "fields" },
-        field("Model", chat, ch.chat.length ? `${ch.chat.length} to choose from` : "No models yet: add one under Models, or set up Qwen3-0.6B.", true),
+        field("GPU model", chat, ch.chat.length ? `${ch.chat.length} to choose from` : "No models yet: add one under Models, or set up Qwen3-0.6B.", true),
+        field("CPU model (when the GPUs are full)", chatCpu, cpuNote, true),
         h("div", { class: "row wide" }, btn("Set up Qwen3-0.6B", async () => { await setupAssistant(); openAssistantSettings(true); }, "sm", "download"),
           h("span", { class: "muted mono-sm" }, "Uses the file if it is already in your models folder, otherwise downloads it, saves a profile for it and picks it."))),
       h("details", { class: "advanced", open: cfg.mode === "endpoint" }, h("summary", {}, "Advanced: use a model on another server"),
@@ -3736,9 +3746,12 @@ function renderAssistantSettings() {
           h("label", { class: "check wide" }, useOther, "Use another OpenAI-compatible server instead of Argos"),
           field("URL", endpoint, "Its /v1 address.", true), field("Model id", endpointModel)))),
     h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Hard questions")),
-      h("p", { class: "hint" }, "A bigger model to hand a question to when the small one says it is out of its depth: the flag reference, comparing many models, a long log. It is only asked when a turn hands over, so it can be cheap to keep — the download default is the smaller quant, because it may run on CPU, where that is the faster choice."),
+      h("p", { class: "hint" }, "The small model reads off the live data. A question about the past, or one wanting advice or a comparison, goes to a bigger model, which also searches the memory; so does one the small model hands over, or an answer of its with numbers that are not in Argos's data. Which bigger model: one loaded and idle already (below), else the escalation model: its GPU version when it fits in the free VRAM, else its CPU version. If neither can start without waiting or unloading something, the chat says so and the small model answers."),
       h("div", { class: "fields" },
-        field("Escalation model", escalate, "empty: the small model answers everything, including what it cannot do", true),
+        h("label", { class: "check wide", title: "No load and nothing unloaded: a model already in memory that nothing is using answers" },
+          toLoaded, "Use a bigger chat model that is already loaded and idle (the coder between prompts, say) before loading the escalation model"),
+        field("Escalation model (GPU)", escalate, "empty: no model is loaded for hard questions", true),
+        field("Escalation model (CPU, when the GPUs are full)", escalateCpu, cpuNote, true),
         field("Download it at", h("div", { class: "row", style: "gap:8px" }, escalateQuant, escalateFetch), "used only when fetching it"))),
     h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Conversation")),
       h("div", { class: "fields" },
@@ -3754,7 +3767,8 @@ function renderAssistantSettings() {
       h("p", { class: "hint" }, "Pick one of your embedding models (nomic-embed, bge, e5, gte…). There is nothing to connect: the engine serves it like any other model and loads it when the memory needs it. On a GPU it embeds only when the assistant searches, so it does not compete with your models; set up as CPU only (or fallen back to the CPU), it takes nothing from the GPUs and keeps the memory embedded as records come in."),
       h("div", { class: "fields" },
         h("label", { class: "check wide" }, memOn, "Use the memory"),
-        field("Embedding model", embed, ch.embed.length ? `${ch.embed.length} to choose from: embedding models and their profiles` : "No embedding models or profiles yet. Download one under Models (search “nomic-embed”), or save a profile with --embedding.", true),
+        field("Embedding model (GPU)", embed, ch.embed.length ? `${ch.embed.length} to choose from: embedding models and their profiles` : "No embedding models or profiles yet. Download one under Models (search “nomic-embed”), or save a profile with --embedding.", true),
+        field("Embedding model (CPU, when the GPUs are full)", embedCpu, "Best another profile of the same embedding model, so the memory's vectors fit both and switching re-embeds nothing. A different model makes the memory re-embed when it switches.", true),
         field("Records per question", results)),
       h("details", { class: "advanced" }, h("summary", {}, "Advanced: embeddings from another server"),
         h("div", { class: "fields", style: "margin-top:8px" },

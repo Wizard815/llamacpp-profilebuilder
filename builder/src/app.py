@@ -296,6 +296,7 @@ def create_app(config: dict | None = None) -> Flask:
         memory=memory, servers=servers,
         runners=Runners(store, settings, event, lambda: settings.get("paths")["models_dir"], scan_media))
     app.extensions["pb"].assistant.runners = app.extensions["pb"].runners
+    memory.pick = lambda: app.extensions["pb"].assistant.pick("embed")  # GPU or CPU embedding model, per moment
     from .bench import Benches, run_rows
 
     def save_bench(run):
