@@ -240,7 +240,7 @@ def test_digest_compares_models(app, client):
     app.extensions["pb"].store.add_requests([{"source_id": i, "ts": now - 100 - i, "model": m, "tokens_per_second": tg, "prompt_per_second": 500}
                                              for i, (m, tg) in enumerate([("a", 40.0), ("a", 42.0), ("b", 60.0)])])
     d = client.get("/api/assistant/digest").get_json()["digest"]
-    assert "Model speeds last 30d (compare models): b: gen 60.0 t/s" in d and "a: gen 41.0 t/s" in d
+    assert "Model speeds last 2 h (compare models): b: gen 60.0 t/s" in d and "a: gen 41.0 t/s" in d
 
 
 def test_benchmark_runs_of_engine_models_are_named_by_their_profile(app, client):

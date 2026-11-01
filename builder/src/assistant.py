@@ -61,10 +61,18 @@ Builder tunes a llama-server command and saves it as a profile; Profiles lists t
 If the user asks how to do something, name the view to open and the setting to change. A saved profile is the way to keep a launch command: build it in Builder, name it, then it appears in Profiles.
 If LIVE DATA does not cover the question, say so in one line instead of guessing.
 Know llama-server flags (-ngl, -c, --flash-attn, --cache-type-k/v, -lm, --split-mode, --n-cpu-moe, --spec-type) and suggest concrete changes.
-If the question needs something you cannot do - the full flag reference, comparing many models, reading a long log - reply with the single word ESCALATE on its own line and nothing else, and a larger model answers it instead. Do not guess when you could hand over.
+Your job is to read off the numbers in LIVE DATA, exactly as written: which model, which speed, how much memory. Never give a speed or size that is not written there, and never report your own model as the one running unless LIVE DATA says it is the only one.
+If the question needs something you cannot do - the past, advice, comparing many models, the full flag reference, reading a long log - reply with the single word ESCALATE on its own line and nothing else, and a larger model answers it instead, with the database's memory. Do not guess when you could hand over.
 When BUILDER appears in LIVE DATA, the user is in the Builder view and that is the command on their screen: answer about it directly. To propose a change to it, end with one line per flag or environment variable, "ACTION set <flag or VAR> <value>" or "ACTION unset <flag or VAR>" (for example: ACTION set --flash-attn off, ACTION set HSA_ENABLE_SDMA 0). Propose only flags you know; the user applies each one. Never rewrite the whole command unless asked to.
 FLAGS PAGE lines are the user's own notes on flags and environment variables: prefer them. To add a flag or variable to the Flags page, or to write or fix its description, end with "ACTION describe <flag or VAR> <one-sentence description>", one line each; the user adds each one with a click.
 Answer in a few short sentences or a short list."""
+
+# Questions about the past, or that want judgment, go straight to the bigger model with the memory search: the
+# small one only reads off the live data (and hands anything else over with ESCALATE).
+NEEDS_BIG = re.compile(
+    r"\b(why|when did|last (time|week|month|night)|yesterday|history|historical|earlier|before|remember|ever|"
+    r"recommend|suggest|should i|advice|best (settings?|profile|config|way)|compare|comparison|versus|vs\.?|difference|"
+    r"explain|how (do|can|should|would) i|tune|tuning|optimi[sz]e|improve|similar|trend|over time)\b", re.I)
 
 # How many models one question may pull into focus. Two was tight: a question
 # that compares three setups silently lost the third.
@@ -180,7 +188,9 @@ class Assistant:
         self._builder: Optional[dict] = None  # what is on screen this turn, for digest()
 
     # ----- the facts the model sees ----------------------------------------
-    def digest(self, question: str = "", now: Optional[float] = None) -> str:
+    def digest(self, question: str = "", now: Optional[float] = None, memory: bool = True) -> str:
+        """What the model answers from. ``memory`` False leaves out the memory search (the embedding model): the
+        small model reads off the live data, and only the bigger one searches the database."""
         now = now or time.time()
         lines = [f"LIVE DATA ({datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M')})"]
         lines += self._tool_lines(question)
@@ -193,7 +203,10 @@ class Assistant:
                 f"GPU{g['gpu']} {g['name']}: {_f(g['util'])}% busy, VRAM {_f((g['mem_used_mb'] or 0) / 1024, 1)}"
                 f"/{_f((g['mem_total_mb'] or 0) / 1024, 1)} GiB, {_f(g['temp_c'])}°C, {_f(g['power_w'])} W"
                 for g in latest))
-        for label, span in (("last 1h", 3600), ("last 24h", 86400)):
+        # GPU readings and request history are kept for telemetry.keep_minutes (2 h by default): say so
+        kept_s = int(self.settings.get("telemetry").get("keep_minutes") or 120) * 60
+        kept = f"last {kept_s // 3600} h" if kept_s % 3600 == 0 else f"last {kept_s // 60} min"
+        for label, span in (("last 1h", min(3600, kept_s)), (kept, kept_s)):
             rows = self.store.gpu_summary(now - span)
             if rows:
                 lines.append(f"GPU {label}: " + " | ".join(
@@ -210,14 +223,14 @@ class Assistant:
             lines.append("GPU last 7d (hourly): " + " | ".join(
                 f"GPU{g} busiest hour {_f(max(x['util_avg'] or 0 for x in hs))}% avg, hottest "
                 f"{_f(max(x['temp_max'] or 0 for x in hs))}°C" for g, hs in sorted(by_gpu.items())))
-        reqs = self.store.request_stats(now - 86400)
+        reqs = self.store.request_stats(now - kept_s)
         if reqs:
-            lines.append("Requests last 24h (Argos): " + " | ".join(
+            lines.append(f"Requests {kept} (Argos): " + " | ".join(
                 f"{r['model']}: {r['requests']} req, gen {_f(r['tg_avg'], 1)} t/s avg (max {_f(r['tg_max'], 1)}), "
                 f"prompt {_f(r['pp_avg'])} t/s, {r['errors']} errors" for r in reqs[:6]))
-        month = self.store.request_stats(now - 30 * 86400)
+        month = self.store.request_stats(now - kept_s)
         if len(month) > 1:
-            lines.append("Model speeds last 30d (compare models): " + " | ".join(
+            lines.append(f"Model speeds {kept} (compare models): " + " | ".join(
                 f"{r['model']}: gen {_f(r['tg_avg'], 1)} t/s, prompt {_f(r['pp_avg'])} t/s, {r['requests']} req"
                 for r in sorted(month, key=lambda r: -(r["tg_avg"] or 0))[:8]))
         best = self.analytics.best_by_base_model()[:5]
@@ -254,11 +267,12 @@ class Assistant:
                 f"{datetime.fromtimestamp(e['ts']).strftime('%H:%M')} {e['message'][:140]}" for e in problems[:5]))
         if self.inventory is not None:
             lines += self.inventory.digest_lines(now)
-        lines += self.related(question)
+        if memory:
+            lines += self.related(question)
         lines += self._model_focus(question, now)
         if len(lines) > 1 and lines[1].startswith("TOOL RESULTS"):
             # a 0.6B model reads less when it has been handed the answer: leave out the broad summaries
-            lines = [l for l in lines if not l.startswith(("GPU last", "Model speeds last", "Requests last 24h", "MODELS ON DISK", "Most loaded"))]
+            lines = [l for l in lines if not l.startswith(("GPU last", "Model speeds last", "Requests last", "MODELS ON DISK", "Most loaded"))]
         return "\n".join(lines)
 
     def _flags_page_lines(self, question: str, limit: int = 16) -> list[str]:
@@ -794,8 +808,9 @@ class Assistant:
                 return
             # What is on screen for this turn only: digest() reads it while answering.
             self._builder = builder or None
-            # The user can send a question straight to the bigger model.
-            self._escalated = bool(escalate) and bool(self.escalate_model())
+            # The user can send a question straight to the bigger model; one about the past or wanting judgment
+            # goes there too. The small model only reads off the live data.
+            self._escalated = bool(self.escalate_model()) and (bool(escalate) or bool(NEEDS_BIG.search(text)))
             # Starting the model can take a while: run it aside and stream its progress.
             updates: queue.Queue = queue.Queue()
             result: dict = {}
@@ -819,7 +834,8 @@ class Assistant:
                 return
             base, model = result["endpoint"]
             self.store.add_message("user", text)
-            digest = self.digest(text)
+            # the memory search (the embedding model) is the bigger model's; with none set up the small one has it
+            digest = self.digest(text, memory=self._escalated or not self.escalate_model())
             if self.compact(base, model, digest):
                 yield {"type": "compacted", "summary": self.summary()}
             answer = ""
@@ -839,7 +855,7 @@ class Assistant:
                 self._escalated = True
                 yield {"type": "status", "text": f"This is beyond the small model — asking {self.escalate_model()}…"}
                 try:
-                    answer = self._ask_bigger(digest, text)
+                    answer = self._ask_bigger(self.digest(text, memory=True), text)
                 except AssistantError as exc:  # noqa: BLE001 - the small answer stands
                     yield {"type": "status", "text": f"The bigger model could not answer: {exc}"}
                 else:

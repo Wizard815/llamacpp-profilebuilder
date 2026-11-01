@@ -131,3 +131,43 @@ def test_what_is_running_names_the_working_model_with_its_own_speeds(client, app
     assert "prefill 1077 t/s, fastest 1907 slowest 1004 over 47672 tokens, decode 38.1 t/s" in lines[1]
     assert "[the assistant's own model]" in lines[2] and "on the CPU" in lines[2] and "now: idle" in lines[2]
     assert "about 62.80 GiB" in lines[-1], "CPU models take no VRAM"
+
+
+def test_a_model_is_found_by_the_words_of_its_name():
+    from src.assistant_tools import _fuzzy
+    name = "Qwen3-Coder-Next-Q5_K_S-00001-of-00003 qwen3-coder-next-q5_k_s-00001-of-00003"
+    assert _fuzzy("list qwen-coder", name) and _fuzzy("qwen coder q5", name) and _fuzzy("show me coder-next", name)
+    assert not _fuzzy("list gemma", name) and not _fuzzy("list q5", name), "one short word does not name a model"
+    assert not _fuzzy("?", name)
+
+
+def test_what_is_running_and_a_models_details_are_answered_in_code(client, app, monkeypatch):
+    from src import assistant_tools as t
+    monkeypatch.setattr(t, "loaded_now", lambda ctx, q: ["LOADED NOW (1 model(s)):", "- coder (ready, on GPU 0,1): now: idle"])
+    ctx = app.extensions["pb"].assistant._tool_ctx()
+    for q in ("what model is running right now and decode and prefill speeds?", "what's loaded?", "which models are on the cpu"):
+        assert t.direct_answer(ctx, q) == "**LOADED NOW (1 model(s))**\n- coder (ready, on GPU 0,1): now: idle", q
+
+    coder = {"model_id": "qwen3-coder-next", "name": "Qwen3-Coder-Next-Q5_K_S", "loaded_seconds": 60, "origin": "file"}
+    monkeypatch.setattr(t, "model_details", lambda ctx, q: ["MODEL Qwen3-Coder-Next-Q5_K_S:", "- decode speed 38 to 42 t/s"])
+    monkeypatch.setattr(ctx["inventory"], "models_summary", lambda: [coder])
+    client.post("/api/profiles", json={"name": "qwencoder-512-2chat", "base_model": "Qwen3-Coder-Next-Q5_K_S",
+                                       "launch_command": "llama-server -m /m/Qwen3-Coder-Next-Q5_K_S-00001-of-00003.gguf --port 8080"})
+    answer = t.direct_answer(ctx, "list qwen-coder")
+    assert answer.startswith("**MODEL Qwen3-Coder-Next-Q5_K_S**") and "38 to 42 t/s" in answer
+    assert "profiles of Qwen3-Coder-Next-Q5_K_S: qwencoder-512-2chat" in answer
+    assert t.direct_answer(ctx, "?") is None and t.direct_answer(ctx, "why is my prefill slow at 100k tokens?") is None
+
+
+def test_the_small_model_reads_live_data_and_the_bigger_one_gets_the_memory(client, app, monkeypatch):
+    from src.assistant import NEEDS_BIG
+    a = app.extensions["pb"].assistant
+    monkeypatch.setattr(a, "related", lambda q: ["RELATED RECORDS (closest to the question, from the database):", "- [event] x"])
+    assert "RELATED RECORDS" in a.digest("anything", memory=True)
+    assert "RELATED RECORDS" not in a.digest("anything", memory=False), "no embedding search for the small model"
+
+    for q in ("why was prefill slow yesterday?", "what settings should I use for the coder?", "compare gemma vs qwen",
+              "when did the coder last crash", "recommend a context size"):
+        assert NEEDS_BIG.search(q), q
+    for q in ("what is loaded", "gpu temperature now", "how much vram is free"):
+        assert not NEEDS_BIG.search(q), q

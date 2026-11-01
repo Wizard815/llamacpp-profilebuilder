@@ -141,8 +141,27 @@ def gpu_status(ctx: dict, q: str) -> list[str]:
         f"{g['util'] or 0:.0f}% busy, {g['temp_c'] or 0:.0f} °C, {g['power_w'] or 0:.0f} W" for g in gpus]
 
 
+_STOP = {"list", "show", "info", "about", "what", "whats", "which", "the", "for", "model", "models", "details", "detail",
+         "tell", "give", "and", "with", "how", "fast", "speed", "speeds", "decode", "prefill", "is", "are", "me", "on", "of",
+         "my", "this", "that", "does", "do", "run", "runs", "profile", "profiles", "please", "can", "you"}
+
+
+def _words(text: str) -> list[str]:
+    return [w for w in re.split(r"[^a-z0-9.]+", (text or "").lower()) if w]
+
+
+def _fuzzy(q: str, name: str) -> bool:
+    """Every word the question gives (besides the filler) starts a word of the name: "qwen coder" finds
+    Qwen3-Coder-Next-Q5_K_S, "coder q5" too. One short word alone is not enough to name a model."""
+    want = [w for w in _words(q) if w not in _STOP and len(w) >= 2]
+    if not want or (len(want) == 1 and len(want[0]) < 4):
+        return False
+    have = _words(name)
+    return all(any(h.startswith(w) or (len(w) >= 4 and w in h) for h in have) for w in want)
+
+
 def _match(ctx: dict, q: str, limit: int = 3) -> list[dict]:
-    """Models the question names: by name, or by '.6B' style size."""
+    """Models the question names: by name, by the words of its name, or by '.6B' style size."""
     low = re.sub(r"[^a-z0-9.]+", " ", q.lower())
     rows = ctx["inventory"].models_summary()
     hits = []
@@ -150,6 +169,8 @@ def _match(ctx: dict, q: str, limit: int = 3) -> list[dict]:
         name = re.sub(r"[^a-z0-9.]+", " ", (m["name"] or "").lower()).strip()
         if name and name in low:
             hits.append(m)
+    if not hits:
+        hits = [m for m in rows if _fuzzy(q, f"{m['name']} {m.get('model_id') or ''}")]
     if not hits:
         want = _params_b(q)
         if want is not None:
@@ -319,14 +340,56 @@ def list_everything(ctx: dict) -> str:
     return "\n".join(out)
 
 
-def direct_answer(ctx: dict, question: str) -> Optional[str]:
-    """A full answer built in code for plain 'list everything' questions, else None.
+_RUNNING_Q = re.compile(r"\b(what|which|whats|what's)\b.*\b(running|loaded|working|busy|in use|on the gpus?|on the cpu)\b|"
+                        r"\b(running|loaded) (right )?now\b|\bwhat is running\b|\bcurrent(ly)? (running|loaded)\b", re.I)
+_SHOW_Q = re.compile(r"^\s*(list|show|info|details?|tell me about|about|what about|how fast is|speeds? (of|for))\b", re.I)
 
-    A 0.6B model asked to copy 31 lines drops some and miscounts; code does not."""
+
+def _as_markdown(lines: list[str]) -> str:
+    """Tool lines as an answer: headings bold, the rest as they are."""
+    out = []
+    for line in lines:
+        if line.startswith("- "):
+            out.append(line)
+        elif line.strip():
+            head, _, rest = line.partition(":")
+            out.append(f"**{head.strip()}**{(': ' + rest.strip()) if rest.strip() else ''}")
+    return "\n".join(out)
+
+
+def _profiles_for(ctx: dict, model: dict) -> list[str]:
+    names = []
+    try:
+        for p in ctx["store"].list_profiles():
+            if p.get("model_id") == model.get("model_id") or (p.get("base_model") and p.get("base_model") == model.get("name")):
+                names.append(p.get("name") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return [n for n in names if n]
+
+
+def direct_answer(ctx: dict, question: str) -> Optional[str]:
+    """A full answer built in code, else None: 'list everything', what is running now, and one model's details.
+
+    A 0.6B model asked to copy 31 lines drops some and miscounts, and handed a model's speeds it reports its own;
+    code does neither."""
     q = (question or "").strip()
-    if not q or _FILTERED.search(q) or not _LIST_ALL.search(q) or "model" not in q.lower() and "them" not in q.lower():
+    if not q:
         return None
     try:
-        return list_everything(ctx)
+        if _RUNNING_Q.search(q):
+            return _as_markdown(loaded_now(ctx, q))
+        if _LIST_ALL.search(q) and not _FILTERED.search(q) and ("model" in q.lower() or "them" in q.lower()):
+            return list_everything(ctx)
+        if _SHOW_Q.search(q) or len(_words(q)) <= 3:
+            hits = _match(ctx, q)
+            if hits:
+                lines = model_details(ctx, q)
+                for m in hits:
+                    profiles = _profiles_for(ctx, m)
+                    if profiles:
+                        lines.append(f"- profiles of {m['name']}: {', '.join(profiles)}")
+                return _as_markdown(lines) if lines else None
     except Exception:  # noqa: BLE001 - fall back to the model
         return None
+    return None
