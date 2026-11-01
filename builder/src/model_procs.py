@@ -28,8 +28,8 @@ def parse_ps(text: str) -> list[dict]:
         parts = line.split(None, 3)
         if len(parts) < 4 or not parts[0].isdigit() or not parts[1].isdigit() or not parts[2].isdigit():
             continue
-        if not LLAMA.search(parts[3]):
-            continue
+        if not LLAMA.search(os.path.basename(parts[3].split()[0])):
+            continue  # a wrapper or shell naming llama-server, not the process itself
         out.append({"pid": int(parts[0]), "rss_kib": int(parts[1]), "cpu_s": float(parts[2]), "args": parts[3]})
     return out
 
@@ -45,8 +45,10 @@ def local_ps(proc: str = "/proc") -> list[dict]:
     for pid in pids:
         try:
             with open(f"{proc}/{pid}/cmdline", "rb") as f:
-                args = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-            if not LLAMA.search(args):
+                argv = f.read().split(b"\0")
+            args = b" ".join(argv).decode("utf-8", "replace").strip()
+            # the program itself, not a wrapper whose command line names it (remote-llama, the ssh it runs, a shell)
+            if not argv or not LLAMA.search(os.path.basename(argv[0].decode("utf-8", "replace"))):
                 continue
             with open(f"{proc}/{pid}/stat", encoding="utf-8") as f:
                 fields = f.read().rsplit(")", 1)[1].split()

@@ -171,3 +171,30 @@ def test_the_small_model_reads_live_data_and_the_bigger_one_gets_the_memory(clie
         assert NEEDS_BIG.search(q), q
     for q in ("what is loaded", "gpu temperature now", "how much vram is free"):
         assert not NEEDS_BIG.search(q), q
+
+
+def test_how_a_named_model_is_doing_is_answered_live(client, app, monkeypatch):
+    from src import assistant_tools as t
+    lines = ["LOADED NOW (2 model(s)):",
+             "- qwen3-coder-next-q5_k_s-00001-of-00003--qwencoder-512-2chat (ready, on GPU 0,1): 62.73 GiB; now: "
+             "reading a prompt (39600 of 52761 tokens) at 667 t/s prefill; reading a prompt (30060 of 33034 tokens) at 579 t/s prefill",
+             "- qwen3-0.6b-cpu [the assistant's own model] (ready, on the CPU): now: idle"]
+    monkeypatch.setattr(t, "loaded_now", lambda ctx, q: lines)
+    ctx = app.extensions["pb"].assistant._tool_ctx()
+    a1 = t.direct_answer(ctx, "how is the qwen3-coder-next-q5_k_s-00001-of-00003--qwencoder-512-2chat 31.4 doing right now")
+    assert "reading a prompt (39600 of 52761 tokens)" in a1 and "qwen3-0.6b-cpu" not in a1, "the named model only, live"
+    assert "reading a prompt" in t.direct_answer(ctx, "how is the coder doing?")
+    assert "qwen3-0.6b-cpu" in t.direct_answer(ctx, "what is running right now")
+
+
+def test_a_number_must_be_the_same_kind_in_the_data():
+    from src.assistant import unsupported_numbers
+    data = "GPU0: 31.4 GiB VRAM used; coder: prefill 667 t/s"
+    assert unsupported_numbers("It has a decode speed of 31.4 t/s", data) == ["31.4 t/s"], "31.4 is a size there, not a speed"
+    assert unsupported_numbers("31.4 GiB in use, prefill 667 t/s", data) == []
+
+
+def test_a_wrapper_naming_llama_server_is_not_the_model_process():
+    from src.model_procs import parse_ps
+    rows = parse_ps("  77 4096 0 ssh -tt root@llama llama-server --port 5842\n  78 9000000 50 /usr/bin/llama-server --port 5842\n")
+    assert [r["pid"] for r in rows] == [78]

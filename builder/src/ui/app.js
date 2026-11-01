@@ -3000,11 +3000,12 @@ function renderGpu() {
     { title: "Power", unit: "W", key: "power_w" },
   ];
   const boxes = charts.map(() => h("div", { class: "chart" }));
-  // the CPU, once a model runs on it: how busy it is and the RAM in use (the whole machine's)
-  const cpuOn = (d.cpu_models || []).length && (d.cpu || []).length;
+  // the CPU and RAM, beside the GPUs: the whole machine's, with the models that run on the CPU named
+  const cpuOn = (d.cpu || []).length > 0;
   const cpuBoxes = cpuOn ? [h("div", { class: "chart" }), h("div", { class: "chart" })] : [];
   fill($("#gCharts"), boxes, cpuOn ? h("div", { class: "hint", style: "grid-column:1/-1;margin:6px 0 0" },
-    h("b", {}, "CPU"), ` · running on it: ${d.cpu_models.join(", ")} · readings are the whole machine's`) : null, cpuBoxes);
+    h("b", {}, "CPU and RAM"), (d.cpu_models || []).length ? ` · running on the CPU: ${d.cpu_models.join(", ")}` : " · no model runs on the CPU now",
+    " · the whole machine's readings; Schedule → Live shows each CPU model's own") : null, cpuBoxes);
   charts.forEach((c, i) => lineChart(boxes[i], { ...c, xs, series: pick(c.key, c.scale), bucket: d.bucket }));
   if (cpuOn) {
     const cxs = d.cpu.map((r) => r.t);

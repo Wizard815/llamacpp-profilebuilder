@@ -75,19 +75,30 @@ NEEDS_BIG = re.compile(
     r"explain|how (do|can|should|would) i|tune|tuning|optimi[sz]e|improve|similar|trend|over time)\b", re.I)
 
 _NUM_UNIT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(t/s|tokens? per second|tok/s|GiB|GB|MiB|MB|%|°C|W\b)", re.I)
-_NUM = re.compile(r"\d+(?:\.\d+)?")
+_UNIT_KIND = {"t/s": "speed", "tokens per second": "speed", "token per second": "speed", "tok/s": "speed",
+              "gib": "size", "gb": "size", "mib": "size", "mb": "size", "%": "share", "°c": "temp", "w": "power"}
+
+
+def _numbers_by_kind(text: str) -> dict[str, list[float]]:
+    out: dict[str, list[float]] = {}
+    for m in _NUM_UNIT.finditer(text or ""):
+        kind = _UNIT_KIND.get(m.group(2).lower(), m.group(2).lower())
+        out.setdefault(kind, []).append(float(m.group(1).replace(",", "")))
+    return out
 
 
 def unsupported_numbers(answer: str, data: str) -> list[str]:
-    """Speeds, sizes, shares and temperatures in an answer that appear nowhere in the data it was given (a small
-    model reporting its own speed, or making one up). Rounding is allowed: 79 for 79.04, 1.2 for 1.25."""
-    have = [float(x) for x in _NUM.findall(data or "")]
+    """Speeds, sizes, shares and temperatures in an answer that the data it was given never says, as that kind
+    of number: a speed must be a speed there, not the same digits as a size (31.4 GiB is no 31.4 t/s). Catches a
+    small model reporting its own speed, or one from the question. Rounding is allowed: 79 for 79.04."""
+    have = _numbers_by_kind(data)
     out = []
     for m in _NUM_UNIT.finditer(answer or ""):
         v = float(m.group(1).replace(",", ""))
+        kind = _UNIT_KIND.get(m.group(2).lower(), m.group(2).lower())
         if v <= 1:
             continue
-        if not any(abs(v - d) <= max(0.06, 0.012 * d) for d in have):
+        if not any(abs(v - d) <= max(0.06, 0.012 * d) for d in have.get(kind, [])):
             out.append(f"{m.group(1)} {m.group(2)}")
     return out
 

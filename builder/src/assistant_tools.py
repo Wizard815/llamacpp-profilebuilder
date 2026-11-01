@@ -143,7 +143,8 @@ def gpu_status(ctx: dict, q: str) -> list[str]:
 
 _STOP = {"list", "show", "info", "about", "what", "whats", "which", "the", "for", "model", "models", "details", "detail",
          "tell", "give", "and", "with", "how", "fast", "speed", "speeds", "decode", "prefill", "is", "are", "me", "on", "of",
-         "my", "this", "that", "does", "do", "run", "runs", "profile", "profiles", "please", "can", "you"}
+         "my", "this", "that", "does", "do", "run", "runs", "profile", "profiles", "please", "can", "you", "doing", "going",
+         "running", "right", "now", "busy", "idle", "working", "status", "currently", "current", "at", "it", "its", "s"}
 
 
 def _words(text: str) -> list[str]:
@@ -341,7 +342,9 @@ def list_everything(ctx: dict) -> str:
 
 
 _RUNNING_Q = re.compile(r"\b(what|which|whats|what's)\b.*\b(running|loaded|working|busy|in use|on the gpus?|on the cpu)\b|"
-                        r"\b(running|loaded) (right )?now\b|\bwhat is running\b|\bcurrent(ly)? (running|loaded)\b", re.I)
+                        r"\b(running|loaded) (right )?now\b|\bwhat is running\b|\bcurrent(ly)? (running|loaded)\b|"
+                        r"\bhow('s| is| are)\b.*\b(doing|going|running)\b|\bwhat('s| is)\b.*\bdoing\b|\bis\b.*\b(busy|idle|working)\b|"
+                        r"\bstatus of\b|\bdoing (right )?now\b", re.I)
 _SHOW_Q = re.compile(r"^\s*(list|show|info|details?|tell me about|about|what about|how fast is|speeds? (of|for))\b", re.I)
 
 
@@ -378,7 +381,12 @@ def direct_answer(ctx: dict, question: str) -> Optional[str]:
         return None
     try:
         if _RUNNING_Q.search(q):
-            return _as_markdown(loaded_now(ctx, q))
+            lines = loaded_now(ctx, q)
+            if len(lines) < 2:  # the engine cannot say (not set, unreachable): the model answers from what it has
+                return None
+            # a model named in the question: just that one (by its id or the words of its name)
+            named = [l for l in lines[1:] if l.startswith("- ") and (l[2:].split(" ", 1)[0] in q or _fuzzy(q, l[2:].split(" ", 1)[0]))]
+            return _as_markdown(lines[:1] + named if named else lines)
         if _LIST_ALL.search(q) and not _FILTERED.search(q) and ("model" in q.lower() or "them" in q.lower()):
             return list_everything(ctx)
         if _SHOW_Q.search(q) or len(_words(q)) <= 3:
