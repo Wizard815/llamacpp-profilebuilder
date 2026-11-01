@@ -312,7 +312,9 @@ class Assistant:
                 pass
         return {"inventory": self.inventory, "store": self.store, "analytics": self.analytics, "measured": measured,
                 "engine_url": self.settings.get("integrations").get("engine_url") or "",
-                "runners": self.runners, "runner_models": runner_models}
+                "runners": self.runners, "runner_models": runner_models,
+                # the assistant's own chat and memory models: never the answer to "what is running"
+                "own_models": {x for x in (self.settings.get("assistant").get("model"), self.settings.get("memory").get("model")) if x}}
 
     def _direct(self, question: str) -> Optional[str]:
         if self.inventory is None:

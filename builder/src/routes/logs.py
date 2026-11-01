@@ -39,7 +39,17 @@ def gpu_series():
         since = max(since, request.args.get("since", type=float) or since)
     bucket = max(1, min(request.args.get("bucket", bucket, type=int), 3600))
     rows, source = c.store.gpu_series(since, bucket), "raw"
+    cpu_models = []  # what runs on the CPU now: Usage shows the CPU while there is any
+    url = c.settings.get("integrations")["engine_url"]
+    if url:
+        from ..integrations import engine_api
+        try:
+            cpu_models = [m["id"] for m in (engine_api.pool_state(url, timeout=1.0).get("models") or [])
+                          if m.get("on_cpu") and m.get("state") != "stopped"]
+        except Exception:  # noqa: BLE001 - another router or a busy engine: none known
+            pass
     return ok(range=rng, bucket=bucket, source=source, rows=rows, latest=c.store.gpu_latest(),
+              cpu=c.store.cpu_series(since, bucket), cpu_latest=c.store.cpu_latest(), cpu_models=cpu_models,
               collector={"source": c.collector.last_source,
                          "enabled": c.settings.get("telemetry")["enabled"]})
 

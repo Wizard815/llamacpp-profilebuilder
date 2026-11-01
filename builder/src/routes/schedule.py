@@ -253,6 +253,7 @@ def schedule_live():
         except Exception:  # noqa: BLE001
             running_now = []
         return ok(connected=True, error="", pool=engine_api.pool_state(url), at=time.time(), real_gib=real, activity=activity,
+                  cpu=ctx().store.cpu_latest(),
                   runners=runners, requests=requests, running=running_now)
     except Exception as exc:  # noqa: BLE001
         return ok(connected=False, error=str(exc), pool=None)

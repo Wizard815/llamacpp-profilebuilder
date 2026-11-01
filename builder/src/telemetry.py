@@ -121,9 +121,25 @@ def _ts(value) -> float:
 
 def read_engine(base_url: str) -> list[dict]:
     """Latest reading per GPU from Argos's /api/performance."""
-    data = _get_json(base_url.rstrip("/") + "/api/performance")
+    return read_engine_full(base_url)[0]
+
+
+def read_engine_full(base_url: str) -> tuple[list[dict], Optional[dict]]:
+    """(the latest reading per GPU, the latest CPU and RAM reading) from the engine's /api/performance, the last
+    half minute of it. The CPU reading is the machine's: models running on the CPU in another container on the
+    same host count in it."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30))
+    data = _get_json(base_url.rstrip("/") + "/api/performance?after=" + urllib.parse.quote(since))
     if not data.get("enabled"):
-        return []
+        return [], None
+    sys_rows = data.get("sys_stats") or data.get("system_stats") or []
+    cpu = None
+    if sys_rows:
+        s = max(sys_rows, key=lambda r: _ts(r.get("timestamp")))
+        cores = [float(x) for x in s.get("cpu_util_per_core") or [] if x is not None]
+        cpu = {"util": round(sum(cores) / len(cores), 1) if cores else None, "cores": len(cores),
+               "mem_used_mb": s.get("mem_used_mb"), "mem_total_mb": s.get("mem_total_mb"),
+               "swap_used_mb": s.get("swap_used_mb"), "load1": s.get("load_avg_1")}
     latest: dict[int, dict] = {}
     for g in data.get("gpu_stats") or []:
         gid = int(g.get("id", 0))
@@ -132,7 +148,29 @@ def read_engine(base_url: str) -> list[dict]:
     return [{"gpu": gid, "name": g.get("name") or f"GPU {gid}", "util": g.get("gpu_util_pct"),
              "mem_used_mb": g.get("mem_used_mb"), "mem_total_mb": g.get("mem_total_mb"),
              "temp_c": g.get("temp_c"), "power_w": g.get("power_draw_w"), "source": "engine"}
-            for gid, g in sorted(latest.items())]
+            for gid, g in sorted(latest.items())], cpu
+
+
+def read_local_cpu(prev: Optional[tuple] = None) -> tuple[Optional[dict], Optional[tuple]]:
+    """CPU and RAM of this machine from /proc (Linux), for when the engine does not report them. CPU busy is
+    worked out between two readings, so the first one has none. Returns (reading, the counters to pass next time)."""
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            first = f.readline().split()[1:]
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            mem = {line.split(":")[0]: int(line.split()[1]) for line in f if line.split()[1:2] and line.split()[1].isdigit()}
+    except (OSError, ValueError, IndexError):
+        return None, prev
+    nums = [int(x) for x in first]
+    idle, total = nums[3] + (nums[4] if len(nums) > 4 else 0), sum(nums)
+    util = None
+    if prev and total > prev[1]:
+        util = round(100.0 * (1 - (idle - prev[0]) / (total - prev[1])), 1)
+    total_kb, avail_kb = mem.get("MemTotal", 0), mem.get("MemAvailable", mem.get("MemFree", 0))
+    return ({"util": util, "cores": os.cpu_count() or 0, "mem_used_mb": round((total_kb - avail_kb) / 1024, 1),
+             "mem_total_mb": round(total_kb / 1024, 1),
+             "swap_used_mb": round((mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) / 1024, 1),
+             "load1": os.getloadavg()[0] if hasattr(os, "getloadavg") else None}, (idle, total))
 
 
 def fetch_activity(base_url: str, after_id: int, limit: int = 999, order: str = "asc") -> list[dict]:
@@ -195,6 +233,8 @@ class Collector:
         self._last_hooks = 0.0
         self._thread: Optional[threading.Thread] = None
         self._last_rollup = 0.0
+        self.last_cpu: Optional[dict] = None
+        self._cpu_prev: Optional[tuple] = None
         self._reported: dict[str, float] = {}
         self.last_source = ""
 
@@ -250,7 +290,11 @@ class Collector:
         url = s["integrations"].get("engine_url") or ""
         readers: list[tuple[str, Callable[[], list[dict]]]] = []
         if source in ("auto", "engine") and url:
-            readers.append(("engine", lambda: read_engine(url)))
+            def engine_reader():
+                rows, cpu = read_engine_full(url)
+                self.last_cpu = cpu
+                return rows
+            readers.append(("engine", engine_reader))
         if source in ("auto", "local"):
             readers += [("sysfs", read_amd_sysfs), ("nvidia-smi", read_nvidia_smi)]
         errors = []
@@ -269,10 +313,17 @@ class Collector:
 
     def tick(self, now: Optional[float] = None) -> None:
         now = now or time.time()
+        self.last_cpu = None
         rows = self.sample()
         for r in rows:
             r["ts"] = now
         self.store.add_gpu_samples(rows)
+        # CPU and RAM beside the GPUs: from the engine's reading, else this machine's own
+        cpu = self.last_cpu
+        if cpu is None:
+            cpu, self._cpu_prev = read_local_cpu(self._cpu_prev)
+        if cpu and (cpu.get("util") is not None or cpu.get("mem_total_mb")):
+            self.store.add_cpu_sample({**cpu, "ts": now})
         note_cards(rows)  # AMD or NVIDIA, for the Builder's GPU pick
         self.sync_activity()
         if now - self._last_rollup > 60:

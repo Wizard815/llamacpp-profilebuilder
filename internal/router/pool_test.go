@@ -613,3 +613,14 @@ func TestPool_CPUOnlyModelTakesNoRoom(t *testing.T) {
 	assert.True(t, p.runsOnCPU("cpu"))
 	assert.Zero(t, p.size("cpu"))
 }
+
+// A model on the CPU holds no VRAM, so it is never unloaded to make room on
+// the GPUs: not even when nothing frees enough and the pool frees all it can.
+func TestPool_CPUModelsAreNeverEvictedForAGPUModel(t *testing.T) {
+	p, _ := newTestPool(62, map[string]float64{"coder": 62.7, "embed": 0.7, "chat": 0.8, "old": 10})
+	p.cpuOnly["embed"] = true
+	p.onCPU["chat"] = true
+	evict := p.EvictionFor("coder", []string{"embed", "chat", "old"})
+	assert.Equal(t, []string{"old"}, evict, "too big to fit even alone: everything on the GPUs goes, the CPU models stay")
+	assert.Empty(t, p.EvictionFor("coder", []string{"embed", "chat"}))
+}

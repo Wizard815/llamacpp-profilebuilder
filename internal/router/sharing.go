@@ -36,6 +36,8 @@ type ShareView struct {
 	ID    string
 	Cards []string
 	Slots []Slot
+	// CPU: the model runs on the CPU, so it shares no GPU with anyone
+	CPU bool
 }
 
 type ShareWatch struct {
@@ -73,6 +75,9 @@ func (w *ShareWatch) Sample(models []ShareView, now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, a := range models {
+		if a.CPU {
+			continue // not on a GPU: nothing to learn about sharing one
+		}
 		// one chat at a time: two of its own slots slow it down by themselves
 		if len(a.Slots) != 1 || a.Slots[0].Phase != PhaseGenerating || a.Slots[0].GenTokensPerSecond <= 0 {
 			continue
@@ -84,7 +89,7 @@ func (w *ShareWatch) Sample(models []ShareView, now time.Time) {
 		w.lastSeen[a.ID] = sl.Updated
 		var beside []string
 		for _, b := range models {
-			if b.ID != a.ID && len(b.Slots) > 0 && SharesCards(a.Cards, b.Cards) {
+			if b.ID != a.ID && !b.CPU && len(b.Slots) > 0 && SharesCards(a.Cards, b.Cards) {
 				beside = append(beside, b.ID)
 			}
 		}

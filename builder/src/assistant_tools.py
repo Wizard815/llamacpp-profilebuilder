@@ -92,16 +92,43 @@ def loaded_now(ctx: dict, q: str) -> list[str]:
     except Exception:  # noqa: BLE001 - group router: no sizes
         pool = {}
     plan = ctx["measured"]
-    lines = [f"LOADED NOW ({len(running)} model(s); each size is that model's own VRAM, not the GPU total):"]
+    own = ctx.get("own_models") or set()
+    lines = [f"LOADED NOW ({len(running)} model(s); each size is that model's own memory, not the GPU total). "
+             "Speeds are that model's own, from its log and its last request; copy them as written:"]
     total = 0.0
-    for r in running:
+
+    def busy(m: dict) -> bool:
+        return bool(m.get("slots") or m.get("in_flight"))
+    # the models working now first, the assistant's own last: "what is running" means the work, not the helper
+    order = sorted(running, key=lambda r: (r["model"] in own, not busy(pool.get(r["model"]) or {}), r["model"]))
+    for r in order:
         mid = r["model"]
-        gib = (plan.get(mid) or {}).get("gib") or (pool.get(mid) or {}).get("size_gib")
+        p = pool.get(mid) or {}
+        gib = (plan.get(mid) or {}).get("gib") or p.get("size_gib")
         kind = "measured" if (plan.get(mid) or {}).get("gib") else "estimated"
-        cards = (pool.get(mid) or {}).get("cards") or []
-        total += gib or 0
-        lines.append(f"- {mid} ({r.get('state')}): {_gib(gib)} {kind if gib else ''}" + (f" on GPU {','.join(cards)}" if cards else ""))
-    lines.append(f"Models together: about {_gib(total)}.")
+        cards = p.get("cards") or []
+        where = "on the CPU" if p.get("on_cpu") else f"on GPU {','.join(cards)}" if cards else ""
+        total += 0 if p.get("on_cpu") else (gib or 0)
+        doing = []
+        for sl in p.get("slots") or []:  # what each busy slot does right now
+            if sl.get("phase") == "prefill":
+                doing.append(f"reading a prompt ({sl.get('tokens', 0)} of {sl.get('total') or '?'} tokens) at {sl.get('tokens_per_second') or 0:.0f} t/s prefill")
+            else:
+                doing.append(f"writing an answer at {sl.get('gen_tokens_per_second') or 0:.1f} t/s decode")
+        status = "; ".join(doing) or ("busy" if p.get("in_flight") else "idle")
+        last = ""
+        try:
+            req = next((x for x in ctx["store"].list_requests(model=mid, limit=5) if (x.get("tokens_per_second") or 0) > 0), None)
+        except Exception:  # noqa: BLE001 - speeds are a bonus
+            req = None
+        if req:
+            rng = (f", fastest {req['prefill_high_tps']:.0f} slowest {req['prefill_low_tps']:.0f}"
+                   if req.get("prefill_high_tps") and req.get("prefill_low_tps") else "")
+            last = (f"; last request: prefill {req.get('prompt_per_second') or 0:.0f} t/s{rng} over {req.get('input_tokens') or 0} "
+                    f"tokens, decode {req.get('tokens_per_second') or 0:.1f} t/s")
+        mine = " [the assistant's own model]" if mid in own else ""
+        lines.append(f"- {mid}{mine} ({r.get('state')}, {where or 'placement unknown'}): {_gib(gib)} {kind if gib else ''}; now: {status}{last}")
+    lines.append(f"Models on the GPUs together: about {_gib(total)}.")
     return lines
 
 
@@ -214,7 +241,7 @@ def runners_info(ctx: dict, q: str) -> list[str]:
 
 # ----- choosing -----------------------------------------------------------------------
 _RULES: list[tuple[re.Pattern, Callable[[dict, str], list[str]]]] = [
-    (re.compile(r"\b(loaded|running|in use|memory|vram|loaded now|on the gpu|resident)\b", re.I), loaded_now),
+    (re.compile(r"\b(loaded|running|in use|memory|vram|loaded now|on the gpu|resident|right now|working|on the cpu)\b", re.I), loaded_now),
     (re.compile(r"\b(gpu|temp|temperature|power|watts|busy|utili[sz]ation)\b|\bvram\b", re.I), gpu_status),
     (re.compile(r"\b(have|list|which|what models|models do|installed|on disk|close to|around|about|smallest|largest|biggest|params?|size|gb|gib)\b|\d\s?b\b|~", re.I), models_on_disk),
     (re.compile(r"\b(spec|specs|details?|tell me about|info)\b", re.I), model_details),

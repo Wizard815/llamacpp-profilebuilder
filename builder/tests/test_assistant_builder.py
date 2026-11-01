@@ -102,3 +102,32 @@ def test_the_flags_page_takes_a_pasted_line_and_descriptions(client):
     assert env["NEW_ONE"]["description"] == "first" and env["OTHER_ONE"]["description"] == "second"
     flags = {r["flag"]: r for r in client.get("/api/flags").get_json()["rows"]}
     assert flags["n-gpu-layers"]["description"] == "layers on the GPU"
+
+
+def test_what_is_running_names_the_working_model_with_its_own_speeds(client, app):
+    import time
+
+    from src.assistant_tools import loaded_now
+
+    from .fakes import make_engine, serve
+    running = [{"model": "qwen3-0.6b-cpu", "state": "ready", "cmd": "x"}, {"model": "coder", "state": "ready", "cmd": "y"},
+               {"model": "embed-cpu", "state": "ready", "cmd": "z"}]
+    pool = {"router": "pool", "enabled": True, "cards": [], "queue": [], "swaps": [], "models": [
+        {"id": "coder", "state": "ready", "size_gib": 62.8, "cards": ["0", "1"], "in_flight": 1,
+         "slots": [{"id": 0, "phase": "prefill", "tokens": 30000, "total": 47668, "tokens_per_second": 1155.3}]},
+        {"id": "qwen3-0.6b-cpu", "state": "ready", "size_gib": 0.8, "on_cpu": True},
+        {"id": "embed-cpu", "state": "ready", "size_gib": 0.7, "on_cpu": True}]}
+    a = app.extensions["pb"].assistant
+    store = app.extensions["pb"].store
+    store.add_requests([{"source_id": 1, "ts": time.time(), "model": "coder", "input_tokens": 47672, "output_tokens": 188,
+                         "prompt_per_second": 1076.96, "tokens_per_second": 38.11, "prefill_high_tps": 1907.0, "prefill_low_tps": 1004.0}])
+    client.put("/api/settings/assistant", json={"model": "qwen3-0.6b-cpu"})
+    client.put("/api/settings/memory", json={"model": "embed-cpu"})
+    with serve(make_engine([], [], running=running, pool=pool)) as url:
+        client.put("/api/settings/integrations", json={"engine_url": url})
+        lines = loaded_now(a._tool_ctx(), "what model is running right now")
+    assert lines[1].startswith("- coder (ready, on GPU 0,1)"), "the working model first, not the assistant's own"
+    assert "reading a prompt (30000 of 47668 tokens) at 1155 t/s prefill" in lines[1]
+    assert "prefill 1077 t/s, fastest 1907 slowest 1004 over 47672 tokens, decode 38.1 t/s" in lines[1]
+    assert "[the assistant's own model]" in lines[2] and "on the CPU" in lines[2] and "now: idle" in lines[2]
+    assert "about 62.80 GiB" in lines[-1], "CPU models take no VRAM"

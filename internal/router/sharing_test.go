@@ -64,3 +64,23 @@ func TestSharing_ModelsOnOtherCardsAndTwoOwnChatsAreNotCounted(t *testing.T) {
 	_, ok := w.Solo("c")
 	assert.False(t, ok, "two chats of its own slow it by themselves: not its speed alone")
 }
+
+// A model on the CPU shares no GPU: a GPU model working beside it is still
+// "alone" on its cards, and the CPU model learns no slowdown at all.
+func TestSharing_ACPUModelSharesNoGPU(t *testing.T) {
+	w := NewShareWatch()
+	now := time.Unix(1000, 0)
+	for i := 0; i < 4; i++ {
+		now = now.Add(3 * time.Second)
+		w.Sample([]ShareView{
+			{ID: "coder", Cards: []string{"0", "1"}, Slots: gen(0, 40, now)},
+			{ID: "chat-cpu", CPU: true, Slots: gen(1, 10, now)},
+		}, now)
+	}
+	solo, ok := w.Solo("coder")
+	require.True(t, ok)
+	assert.InDelta(t, 40, solo, 0.01, "the CPU model working beside it does not count as sharing")
+	assert.Empty(t, w.Slowdowns("coder"))
+	_, ok = w.Solo("chat-cpu")
+	assert.False(t, ok, "nothing learned for a model off the GPUs")
+}

@@ -2857,7 +2857,20 @@ function gpuView() {
   const rows = [...groups.values()].sort((a, b) => a.t - b.t || a.gpu - b.gpu).map((g) => ({
     t: g.t, gpu: g.gpu, name: g.name, n: g.n, util_max: g.util_max, temp_max: g.temp_max, mem_total_mb: g.mem_total_mb,
     ...Object.fromEntries(Object.keys(g.sum).map((k) => [k, g.sum[k] / g.cnt[k]])) }));
-  return { ...G.meta, rows, bucket, source: "raw" };
+  // the CPU the same way: one row per bucket
+  const cg = new Map();
+  for (const r of G.cbuf || []) {
+    if (r.t < since) continue;
+    const t = Math.floor(r.t / bucket) * bucket;
+    let g = cg.get(t);
+    if (!g) cg.set(t, g = { t, n: 0, util: 0, un: 0, mem: 0, mn: 0, util_max: null, mem_total_mb: null });
+    if (r.util != null) { g.util += r.util; g.un++; g.util_max = Math.max(g.util_max ?? r.util, r.util_max ?? r.util); }
+    if (r.mem_used_mb != null) { g.mem += r.mem_used_mb; g.mn++; }
+    if (r.mem_total_mb != null) g.mem_total_mb = Math.max(g.mem_total_mb ?? 0, r.mem_total_mb);
+  }
+  const cpu = [...cg.values()].sort((a, b) => a.t - b.t).map((g) => ({ t: g.t, util: g.un ? g.util / g.un : null, util_max: g.util_max,
+    mem_used_mb: g.mn ? g.mem / g.mn : null, mem_total_mb: g.mem_total_mb }));
+  return { ...G.meta, rows, cpu, bucket, source: "raw" };
 }
 const seriesColor = (i) => `var(--series-${(i % 8) + 1})`;
 
@@ -2986,8 +2999,19 @@ function renderGpu() {
     { title: "Power", unit: "W", key: "power_w" },
   ];
   const boxes = charts.map(() => h("div", { class: "chart" }));
-  fill($("#gCharts"), boxes);
+  // the CPU, once a model runs on it: how busy it is and the RAM in use (the whole machine's)
+  const cpuOn = (d.cpu_models || []).length && (d.cpu || []).length;
+  const cpuBoxes = cpuOn ? [h("div", { class: "chart" }), h("div", { class: "chart" })] : [];
+  fill($("#gCharts"), boxes, cpuOn ? h("div", { class: "hint", style: "grid-column:1/-1;margin:6px 0 0" },
+    h("b", {}, "CPU"), ` · running on it: ${d.cpu_models.join(", ")} · readings are the whole machine's`) : null, cpuBoxes);
   charts.forEach((c, i) => lineChart(boxes[i], { ...c, xs, series: pick(c.key, c.scale), bucket: d.bucket }));
+  if (cpuOn) {
+    const cxs = d.cpu.map((r) => r.t);
+    const ramTop = Math.max(...d.cpu.map((r) => (r.mem_total_mb || 0) / 1024));
+    lineChart(cpuBoxes[0], { title: "CPU busy", unit: "%", yMax: 100, xs: cxs, series: [{ name: "CPU", values: d.cpu.map((r) => r.util) }], bucket: d.bucket });
+    lineChart(cpuBoxes[1], { title: "RAM used", unit: "GiB", yMax: ramTop || undefined, digits: 1, xs: cxs,
+      series: [{ name: "RAM", values: d.cpu.map((r) => (r.mem_used_mb == null ? null : r.mem_used_mb / 1024)) }], bucket: d.bucket });
+  }
   const stat = (g, key, f) => { const v = d.rows.filter((r) => r.gpu === g && r[key] != null).map((r) => r[key]); return v.length ? f(v) : null; };
   const avg = (v) => v.reduce((a, b) => a + b, 0) / v.length, max = (v) => Math.max(...v);
   const latest = new Map((d.latest || []).map((r) => [r.gpu, r]));
@@ -3016,7 +3040,8 @@ async function loadGpu() {
       const d = await api("GET", `/api/gpu/series?range=1h&bucket=${BUF_BUCKET}${last != null ? `&since=${last}` : ""}${live ? "&live=1" : ""}`);
       const cut = Date.now() / 1000 - BUF_SPAN;
       G.buf = G.buf.filter((r) => r.t >= cut && (last == null || r.t < last)).concat(d.rows);
-      G.meta = { latest: d.latest, collector: d.collector };
+      G.cbuf = (G.cbuf || []).filter((r) => r.t >= cut && (last == null || r.t < last)).concat(d.cpu || []);
+      G.meta = { latest: d.latest, collector: d.collector, cpu_models: d.cpu_models || [], cpu_latest: d.cpu_latest };
       // drawn on every poll, new reading or not: the window moves with the clock, so the lines glide left.
       // While the pointer reads a chart only a new reading redraws it, so the value under it stays put.
       const sig = JSON.stringify([G.buf.length, G.buf[G.buf.length - 1]]);
@@ -3333,6 +3358,10 @@ function renderServerLogSources() {
   fill($("#navServerLogs"), engine.length ? String(engine.length) : null);
 }
 const SL_ERR = /error|failed|out of memory|exception|invalid argument|abort|fatal|cannot|unable/i;
+// llama.cpp finding no GPU: expected for a model kept off the GPUs (CPU only), a real problem for any other
+const SL_NO_GPU = /no (ROCm|CUDA)-capable device|failed to initialize (ROCm|CUDA)|no usable GPU found|gpu-layers option will be ignored|compiled without GPU support|consult docs\/build\.md/i;
+const runsOnCpu = (src) => !!src && (src.on_cpu || /(HIP|CUDA|ROCR)_VISIBLE_DEVICES=-1\b|(^|\s)(-ngl|--n-gpu-layers|--gpu-layers)[ =]0\b/.test(src.command || ""));
+const slErr = (line, cpu) => SL_ERR.test(line) && !(cpu && SL_NO_GPU.test(line));
 const SL_PERF = /eval time|tokens per second|t\/s|prompt eval/i;
 async function loadServerLogs(force) {
   renderServerLogSources();
@@ -3348,11 +3377,12 @@ async function loadServerLogs(force) {
     const src = slSources().all.find((x) => x.launch_id === id);
     $("#slTitle").textContent = src ? (src.profile_name || src.base_model || id) : id;
     const q = $("#slFilter").value.trim().toLowerCase(), errOnly = $("#slErrors").checked;
-    const lines = text.split("\n").filter((l) => (!q || l.toLowerCase().includes(q)) && (!errOnly || SL_ERR.test(l)));
+    const cpu = runsOnCpu(src) || /(HIP|CUDA|ROCR)_VISIBLE_DEVICES=-1\b/.test(text);
+    const lines = text.split("\n").filter((l) => (!q || l.toLowerCase().includes(q)) && (!errOnly || slErr(l, cpu)));
     const pre = $("#slLog");
     const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
     fill(pre, lines.length ? lines.map((line) => {
-      const cls = SL_ERR.test(line) ? "ln-err" : SL_PERF.test(line) ? "ln-perf" : /listening|all slots are idle|model loaded/i.test(line) ? "ln-ok" : "";
+      const cls = slErr(line, cpu) ? "ln-err" : cpu && SL_NO_GPU.test(line) ? "muted" : SL_PERF.test(line) ? "ln-perf" : /listening|all slots are idle|model loaded/i.test(line) ? "ln-ok" : "";
       return [cls ? h("span", { class: cls }, line) : line, "\n"];
     }) : h("span", { class: "muted" }, text ? "No line matches." : "Nothing logged yet."));
     if ($("#slFollow").checked && (atBottom || force)) pre.scrollTop = pre.scrollHeight;
@@ -3367,7 +3397,7 @@ async function loadServerLogs(force) {
       dec = [...byTask.values()];
     }
     const pre_ = [...text.matchAll(/prompt eval time.*?([\d.]+) tokens per second/gi)].map((m) => +m[1]);
-    const errs = text.split("\n").filter((l) => SL_ERR.test(l)).length;
+    const errs = text.split("\n").filter((l) => slErr(l, cpu)).length;
     const stat = (k, v, unit) => h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v, unit && h("small", {}, unit)));
     fill($("#slStats"), special ? null : [
       stat("Requests", dec.length || DASH),
@@ -5054,6 +5084,32 @@ function sharingCard(models, plan) {
     `${m.solo_tps ? `${num(m.solo_tps * sd.ratio, 1)} t/s · ` : ""}${pct(sd.ratio)} (−${num((1 - sd.ratio) * 100, 0)}%)`, `${sd.samples}×`,
     sd.ratio < keep ? h("span", { class: `pill ${guard ? "warn" : ""}`, title: guard ? `a request for ${sd.beside} waits while ${m.id} answers` : "turn the share guard on in Plan to hold it" }, guard ? `holds ${sd.beside}` : "would hold") : DASH]))));
 }
+/** The CPU, once a model runs on it (CPU only, or fallen back from the GPUs): how busy it is, the RAM the models
+ *  take beside everything else, and what each of them is doing. The readings are the whole machine's. */
+function cpuCard(models, cpu) {
+  if (!models.length) return null;
+  const gibOf = (mb) => (mb || 0) / 1024;
+  const total = cpu ? gibOf(cpu.mem_total_mb) : 0, used = cpu ? gibOf(cpu.mem_used_mb) : 0;
+  const parts = models.map((m) => ({ id: m.id, gib: m.size_gib || 0 })).filter((p) => p.gib > 0);
+  const theirs = parts.reduce((a, p) => a + p.gib, 0);
+  const other = Math.max(used - theirs, 0);
+  const util = cpu && cpu.util != null ? cpu.util : null;
+  return h("div", { class: "gpu-cards", style: "margin-top:-4px" }, h("div", { class: "gpu-card" },
+    h("div", { class: "head" }, h("b", {}, "CPU"),
+      h("span", { title: "the whole machine: busy share of every core, RAM in use, load average" },
+        util != null ? `${num(util, 0)}% busy` : "busy: no reading yet",
+        cpu && cpu.cores ? h("small", { class: "muted" }, ` · ${cpu.cores} cores${cpu.load1 != null ? ` · load ${num(cpu.load1, 1)}` : ""}`) : null)),
+    h("div", { class: "vbar", title: `${num(util || 0, 0)}% of the CPU is busy` },
+      h("i", { style: `width:${Math.min(100, util || 0)}%; background:var(--yellow, #e5c07b)` })),
+    total ? [h("div", { class: "head", style: "margin-top:8px" }, h("span", { class: "muted" }, "RAM"),
+      h("span", {}, `${num(used, 1)} / ${num(total, 0)} GiB`, cpu.swap_used_mb ? h("small", { class: "muted", title: "swap in use: the machine is short of RAM, and a model in swap is very slow" }, ` · swap ${num(gibOf(cpu.swap_used_mb), 1)}`) : null)),
+      h("div", { class: "vbar", title: `${num(Math.max(total - used, 0), 1)} GiB free` },
+        parts.map((p) => h("i", { style: `width:${Math.min(100, (p.gib / total) * 100)}%; background:${segColor(p.id)}`, title: `${p.id}: about ${num(p.gib)} GiB` })),
+        other ? h("i", { style: `width:${Math.min(100, (other / total) * 100)}%; background:repeating-linear-gradient(45deg, var(--muted, #888) 0 4px, transparent 4px 8px)`, title: `everything else: ${num(other, 1)} GiB` }) : null)] : null,
+    h("div", { class: "vbar-legend" }, models.map((m) => h("span", { style: `--c:${segColor(m.id)}`, title: m.cpu_only === false ? "fell back to the CPU: it did not fit on the GPUs" : "runs on the CPU" },
+      `${m.id}${m.size_gib ? ` ~${num(m.size_gib)} GiB` : ""}`, " ", workPill(m) || h("span", { class: "muted" }, "idle"))))));
+}
+
 // A model that died: the line it died on, so nobody has to dig through the log for it.
 function crashCard(models) {
   const hit = models.filter((m) => m.crash);
@@ -5142,6 +5198,7 @@ function renderLive() {
       h("span", { class: "muted" }, `${num(P.budget_gib)} GiB usable · models used in the last ${span(P.protect_seconds)} ${(SC.data && SC.data.plan && SC.data.plan.protect_waits === false) ? "are evicted last" : "stay loaded; other models' requests wait"}`),
       h("span", { class: "spacer" }), h("span", { class: "hint", style: "margin:0" }, `updated ${ago(L.at)}`)),
     cardBars(cards, usage, L.real_gib),
+    cpuCard(P.models.filter((m) => m.on_cpu && m.state !== "stopped"), L.cpu),
     h("p", { class: "hint", style: "margin:-4px 0 12px" }, "Bars are the planned sizes the scheduler fits models by; “in use” is what the GPU reports. After a model loads once, Argos measures its real size and the plan uses that."),
     swaps, queue, crashCard(P.models), prefillCard(P.models), sharingCard(P.models, SC.data && SC.data.plan),
     requestsCard(L.requests, Object.fromEntries(P.models.filter((m) => m.in_flight).map((m) => [m.id, m.in_flight])),

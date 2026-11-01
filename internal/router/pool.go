@@ -384,7 +384,8 @@ func (p *poolSwapper) evictionForLocked(target string, running []string) []strin
 
 	var candidates []string
 	for _, id := range others {
-		if !p.persistent[id] {
+		// a model on the CPU holds no VRAM: unloading it frees nothing on the GPUs
+		if !p.persistent[id] && !p.onCPU[id] && !p.cpuOnly[id] {
 			candidates = append(candidates, id)
 		}
 	}

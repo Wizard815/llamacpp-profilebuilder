@@ -169,6 +169,11 @@ CREATE TABLE IF NOT EXISTS gpu_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_gpu_samples_ts ON gpu_samples (ts);
 
+CREATE TABLE IF NOT EXISTS cpu_samples (
+    ts REAL NOT NULL, util REAL, cores INTEGER, mem_used_mb REAL, mem_total_mb REAL, swap_used_mb REAL, load1 REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cpu_samples_ts ON cpu_samples (ts);
+
 CREATE TABLE IF NOT EXISTS gpu_hourly (
     hour REAL NOT NULL, gpu INTEGER NOT NULL, name TEXT, samples INTEGER,
     util_avg REAL, util_max REAL, mem_avg_mb REAL, mem_max_mb REAL, mem_total_mb REAL,
@@ -1031,10 +1036,27 @@ class Store:
             self._conn.execute("DELETE FROM requests WHERE ts < ?", (before,))
             self._conn.commit()
 
+    # ----- CPU and RAM, beside the GPUs ------------------------------------
+    def add_cpu_sample(self, s: dict) -> None:
+        self._x("INSERT INTO cpu_samples (ts, util, cores, mem_used_mb, mem_total_mb, swap_used_mb, load1) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", (s["ts"], s.get("util"), s.get("cores"), s.get("mem_used_mb"),
+                                                 s.get("mem_total_mb"), s.get("swap_used_mb"), s.get("load1")))
+
+    def cpu_series(self, since: float, bucket: int) -> list[dict]:
+        return self._q(
+            "SELECT CAST(ts / ? AS INTEGER) * ? AS t, AVG(util) AS util, MAX(util) AS util_max, AVG(mem_used_mb) AS mem_used_mb, "
+            "MAX(mem_total_mb) AS mem_total_mb, AVG(swap_used_mb) AS swap_used_mb, AVG(load1) AS load1, MAX(cores) AS cores "
+            "FROM cpu_samples WHERE ts>=? GROUP BY t ORDER BY t", (bucket, bucket, since))
+
+    def cpu_latest(self) -> Optional[dict]:
+        rows = self._q("SELECT * FROM cpu_samples ORDER BY ts DESC LIMIT 1")
+        return rows[0] if rows else None
+
     def prune_gpu(self, before: float) -> None:
-        """Delete every GPU reading older than ``before``: the raw samples and the hourly rollups."""
+        """Delete every GPU (and CPU) reading older than ``before``: the raw samples and the hourly rollups."""
         with self._lock:
             self._conn.execute("DELETE FROM gpu_samples WHERE ts < ?", (before,))
+            self._conn.execute("DELETE FROM cpu_samples WHERE ts < ?", (before,))
             self._conn.execute("DELETE FROM gpu_hourly WHERE hour < ?", (before - 3600,))
             self._conn.commit()
 

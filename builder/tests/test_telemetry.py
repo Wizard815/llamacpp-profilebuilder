@@ -174,3 +174,36 @@ def test_Collector_series_with_live_turns_it_on(client, app):
     assert not col.live
     client.get("/api/gpu/series?range=5m&live=1")
     assert col.live
+
+
+def test_the_cpu_and_ram_are_read_beside_the_gpus(tmp_path, monkeypatch):
+    import src.telemetry as tel
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    perf = {"enabled": True, "gpu_stats": GPU_STATS, "sys_stats": [
+        {"timestamp": stamp, "cpu_util_per_core": [10, 30, 50, 70], "mem_total_mb": 262144, "mem_used_mb": 65536,
+         "swap_used_mb": 0, "load_avg_1": 3.5}]}
+    asked = []
+    monkeypatch.setattr(tel, "_get_json", lambda url, *a, **k: asked.append(url) or perf)
+    rows, cpu = tel.read_engine_full("http://engine")
+    assert "after=" in asked[0], "only the last half minute, not the whole history"
+    assert cpu == {"util": 40.0, "cores": 4, "mem_used_mb": 65536, "mem_total_mb": 262144, "swap_used_mb": 0, "load1": 3.5}
+    assert [r["gpu"] for r in rows] == [0, 1]
+
+    store = Store(str(tmp_path / "c.db"))
+    col = Collector(store, settings_for("http://engine", source="engine"), lambda *a, **k: None)
+    monkeypatch.setattr(col, "sync_activity", lambda: 0)
+    col.tick(now=now)
+    assert store.cpu_latest()["util"] == 40.0 and store.cpu_series(0, 2)[0]["mem_used_mb"] == 65536
+    store.prune_gpu(now + 1)
+    assert store.cpu_latest() is None, "pruned with the GPU readings"
+
+
+def test_this_machines_cpu_when_the_engine_has_none():
+    import src.telemetry as tel
+    first, counters = tel.read_local_cpu()
+    if first is None:  # not Linux
+        return
+    assert first["util"] is None and first["mem_total_mb"] > 0, "busy needs two readings"
+    second, _ = tel.read_local_cpu(counters)
+    assert second["util"] is None or 0 <= second["util"] <= 100

@@ -225,13 +225,20 @@ func (s *Server) shareViews() []router.ShareView {
 	placer, _ := s.local.(router.Placer)
 	var out []router.ShareView
 	for id := range s.local.RunningModels() {
-		v := router.ShareView{ID: id, Slots: router.Prefills.Slots(id)}
+		v := router.ShareView{ID: id, Slots: router.Prefills.Slots(id), CPU: s.onCPU(id)}
 		if placer != nil {
 			v.Cards = placer.Placement(id)
 		}
 		out = append(out, v)
 	}
 	return out
+}
+
+// onCPU reports whether model runs on the CPU (CPU only, or fallen back): it
+// takes no GPU time, so no share guard applies to it either way.
+func (s *Server) onCPU(model string) bool {
+	cpu, ok := s.local.(interface{ OnCPU(string) bool })
+	return ok && cpu.OnCPU(model)
 }
 
 // watchSharing samples the running models once a second, so the share watch
@@ -261,9 +268,13 @@ func (s *Server) shareHolder(model string, keep float64) (string, router.Slowdow
 	}
 	if mine.ID == "" {
 		mine.ID = model // not loaded: it may be placed anywhere, so it shares every card
+		mine.CPU = s.onCPU(model)
+	}
+	if mine.CPU {
+		return "", router.Slowdown{}, false // on the CPU: it slows no GPU model and waits for none
 	}
 	for _, a := range views {
-		if a.ID == model {
+		if a.ID == model || a.CPU {
 			continue
 		}
 		answering := false
