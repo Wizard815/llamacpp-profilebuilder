@@ -5,6 +5,8 @@
 #   e.g. remote-llama rocm --host 0.0.0.0 --port 5801 -ngl 99 -m /app/models/x.gguf
 #   remote-llama <backend> --bench <llama-bench args...>
 #   runs llama-bench there instead (the Playground's llama-bench tab): no port, nothing forwarded
+#   remote-llama <backend> --ps
+#   lists the llama.cpp processes there with their memory and CPU time (Argos's CPU view)
 #
 # Argos runs this as the model's command. It:
 #   * ssh's into the llama.cpp container for that backend and runs llama-server there
@@ -37,6 +39,14 @@ key="${REMOTE_SSH_KEY:-/run/secrets/argos_ssh_key}"
 [[ -r "$key" ]] || { echo "remote-llama: no SSH key at $key. Set REMOTE_SSH_KEY_FILE in .env to the private key on the host and mount it there (docker-compose.override.yaml: \${REMOTE_SSH_KEY_FILE}:/run/secrets/argos_ssh_key:ro), then recreate the container." >&2; exit 2; }
 known="${REMOTE_KNOWN_HOSTS:-/data/ssh_known_hosts}"
 passthru="${REMOTE_ENV_PASSTHRU:-HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HSA_OVERRIDE_GFX_VERSION LLAMA_ENABLE_MTP_OPT}"
+
+# --ps: what the llama.cpp processes there use, for Argos's CPU view (no tty, nothing forwarded):
+# one line each, "<pid> <rss KiB> <cpu seconds so far> <command line>"
+if [[ "${1:-}" == "--ps" ]]; then
+  exec ssh -i "$key" -p "$sport" \
+    -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known" -o ConnectTimeout=5 \
+    "${user}@${host}" "ps -eo pid=,rss=,times=,args= 2>/dev/null | grep -E '[l]lama-(server|bench)' || true"
+fi
 
 # llama-bench: the binary beside llama-server there (or <NAME>_SSH_BENCH_BIN), no port to forward
 bench=0

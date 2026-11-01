@@ -5100,15 +5100,16 @@ function sharingCard(models, plan) {
 }
 /** The CPU, once a model runs on it (CPU only, or fallen back from the GPUs): how busy it is, the RAM the models
  *  take beside everything else, and what each of them is doing. The readings are the whole machine's. */
-function cpuCard(models, cpu) {
+function cpuCard(models, cpu, procs = {}) {
   if (!models.length) return null;
   const gibOf = (mb) => (mb || 0) / 1024;
   const total = cpu ? gibOf(cpu.mem_total_mb) : 0, used = cpu ? gibOf(cpu.mem_used_mb) : 0;
-  const parts = models.map((m) => ({ id: m.id, gib: m.size_gib || 0 })).filter((p) => p.gib > 0);
+  // each model's own process when it was found (its RAM, the cores it keeps busy), else the planned size
+  const parts = models.map((m) => ({ id: m.id, gib: (procs[m.id] && procs[m.id].rss_gib) || m.size_gib || 0 })).filter((p) => p.gib > 0);
   const theirs = parts.reduce((a, p) => a + p.gib, 0);
   const other = Math.max(used - theirs, 0);
   const util = cpu && cpu.util != null ? cpu.util : null;
-  return h("div", { class: "gpu-cards", style: "margin-top:-4px" }, h("div", { class: "gpu-card" },
+  return h("div", { class: "gpu-cards", style: "margin-top:-4px" }, h("div", { class: "gpu-card", style: "grid-column:1/-1" },
     h("div", { class: "head" }, h("b", {}, "CPU"),
       h("span", { title: "the whole machine: busy share of every core, RAM in use, load average" },
         util != null ? `${num(util, 0)}% busy` : "busy: no reading yet",
@@ -5120,8 +5121,21 @@ function cpuCard(models, cpu) {
       h("div", { class: "vbar", title: `${num(Math.max(total - used, 0), 1)} GiB free` },
         parts.map((p) => h("i", { style: `width:${Math.min(100, (p.gib / total) * 100)}%; background:${segColor(p.id)}`, title: `${p.id}: about ${num(p.gib)} GiB` })),
         other ? h("i", { style: `width:${Math.min(100, (other / total) * 100)}%; background:repeating-linear-gradient(45deg, var(--muted, #888) 0 4px, transparent 4px 8px)`, title: `everything else: ${num(other, 1)} GiB` }) : null)] : null,
-    h("div", { class: "vbar-legend" }, models.map((m) => h("span", { style: `--c:${segColor(m.id)}`, title: m.cpu_only === false ? "fell back to the CPU: it did not fit on the GPUs" : "runs on the CPU" },
-      `${m.id}${m.size_gib ? ` ~${num(m.size_gib)} GiB` : ""}`, " ", workPill(m) || h("span", { class: "muted" }, "idle"))))));
+    h("div", { class: "table-wrap", style: "margin-top:8px" }, h("table", { class: "dense" },
+      h("thead", {}, h("tr", {}, ["Model", "RAM (its own)", "CPU (its own)", "Planned", "Now"].map((x, i) => h("th", { class: i && i < 4 ? "num" : "" }, x)))),
+      h("tbody", {}, models.map((m) => {
+        const p = procs[m.id];
+        const cores = p && p.cores != null ? p.cores : null;
+        const share = cores != null && cpu && cpu.cores ? cores / cpu.cores * 100 : null;
+        return h("tr", {},
+          h("td", { class: "nowrap", title: m.id }, h("span", { class: "swatch", style: `--c:${segColor(m.id)}` }), h("span", { class: "strong" }, m.id)),
+          h("td", { class: "num", title: p ? `resident memory of its llama-server (pid ${p.pid}${p.where !== "local" ? `, in the ${p.where} container` : ""})` : "its process was not found: the planned size is the estimate" },
+            p ? `${num(p.rss_gib, 2)} GiB` : DASH),
+          h("td", { class: "num", title: "cores its process kept busy since the last reading; 100% of one core = 1.0" },
+            cores != null ? `${num(cores, 1)} cores${share != null ? ` · ${num(share, share < 10 ? 1 : 0)}% of the CPU` : ""}` : p ? "measuring…" : DASH),
+          h("td", { class: "num muted", title: "the size the scheduler plans with (an estimate)" }, m.size_gib ? `~${num(m.size_gib)} GiB` : DASH),
+          h("td", {}, workPill(m) || h("span", { class: "muted" }, "idle")));
+      }))))));
 }
 
 // A model that died: the line it died on, so nobody has to dig through the log for it.
@@ -5212,7 +5226,7 @@ function renderLive() {
       h("span", { class: "muted" }, `${num(P.budget_gib)} GiB usable · models used in the last ${span(P.protect_seconds)} ${(SC.data && SC.data.plan && SC.data.plan.protect_waits === false) ? "are evicted last" : "stay loaded; other models' requests wait"}`),
       h("span", { class: "spacer" }), h("span", { class: "hint", style: "margin:0" }, `updated ${ago(L.at)}`)),
     cardBars(cards, usage, L.real_gib),
-    cpuCard(P.models.filter((m) => m.on_cpu && m.state !== "stopped"), L.cpu),
+    cpuCard(P.models.filter((m) => m.on_cpu && m.state !== "stopped"), L.cpu, L.procs || {}),
     h("p", { class: "hint", style: "margin:-4px 0 12px" }, "Bars are the planned sizes the scheduler fits models by; “in use” is what the GPU reports. After a model loads once, Argos measures its real size and the plan uses that."),
     swaps, queue, crashCard(P.models), prefillCard(P.models), sharingCard(P.models, SC.data && SC.data.plan),
     requestsCard(L.requests, Object.fromEntries(P.models.filter((m) => m.in_flight).map((m) => [m.id, m.in_flight])),

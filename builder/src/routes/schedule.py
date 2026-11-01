@@ -17,6 +17,7 @@ from ..schedule_rows import build_rows, plan_sizes
 from ..web import body, check_id, ctx, err, ok
 from . import core
 
+from ..model_procs import ModelProcs
 bp = Blueprint("schedule", __name__)
 APPLY_CHECK_S = 300  # how often the background tick re-checks the engine's copy (it scans the library)
 APPLY_RETRY_S = 60   # ...and how often while models are left out because the engine does not list them yet
@@ -252,14 +253,24 @@ def schedule_live():
             running_now = engine_api.inflight(url)
         except Exception:  # noqa: BLE001
             running_now = []
-        return ok(connected=True, error="", pool=engine_api.pool_state(url), at=time.time(), real_gib=real, activity=activity,
-                  cpu=ctx().store.cpu_latest(),
+        pool = engine_api.pool_state(url)
+        procs = {}
+        if any(m.get("on_cpu") and m.get("state") != "stopped" for m in pool.get("models") or []):
+            try:  # what each model on the CPU really uses: its own process's RAM and cores busy
+                procs = _model_procs.sample(engine_api.running(url))
+            except Exception:  # noqa: BLE001 - the card shows the estimate then
+                procs = {}
+        return ok(connected=True, error="", pool=pool, at=time.time(), real_gib=real, activity=activity,
+                  cpu=ctx().store.cpu_latest(), procs=procs,
                   runners=runners, requests=requests, running=running_now)
     except Exception as exc:  # noqa: BLE001
         return ok(connected=False, error=str(exc), pool=None)
 
 
 # ----- one model in the Live view: load, unload, keep loaded, its log, its launch command --------
+_model_procs = ModelProcs()
+
+
 def _engine_url():
     url = ctx().settings.get("integrations")["engine_url"]
     if not url:
