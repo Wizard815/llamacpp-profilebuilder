@@ -192,6 +192,16 @@ def inflight(base_url: str, timeout: float = 3.0) -> list[dict]:
             for r in rows or [] if isinstance(r, dict)]
 
 
+def model_launch(base_url: str, model_id: str, timeout: float = 3.0) -> dict:
+    """{"cmd", "env"} the engine starts ``model_id`` with, from its /v1/models listing; {} when it is not listed."""
+    data = _get(base_url.rstrip("/") + "/v1/models", timeout)
+    for m in (data.get("data") if isinstance(data, dict) else None) or []:
+        if m.get("id") == model_id:
+            argos = ((m.get("meta") or {}).get("argos") or {})
+            return {"cmd": argos.get("cmd") or "", "env": argos.get("env") or []}
+    return {}
+
+
 def model_ids(base_url: str, timeout: float = 3.0) -> set[str]:
     """Ids the engine lists at ``/v1/models`` (variants included, unlisted models not)."""
     data = _get(base_url.rstrip("/") + "/v1/models", timeout)

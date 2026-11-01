@@ -683,6 +683,28 @@ class Assistant:
         self.on_event("assistant", f"started the embedding model {model_id}: the new numbers are searchable")
         return True
 
+    def embed_on_cpu(self) -> bool:
+        """Whether the memory's embedding model runs on the CPU: kept off the GPUs by its command (CPU only),
+        or fallen back to the CPU now. Then embedding takes nothing from the models on the GPUs, so the memory
+        embeds as records come in instead of waiting for a search. Rechecked once a minute."""
+        now = time.time()
+        model = str(self.settings.get("memory").get("model") or "")
+        cached = getattr(self, "_embed_cpu", None)
+        if cached and cached[0] == model and now - cached[1] < 60:
+            return cached[2]
+        url, on = self._engine(), False
+        if url and model:
+            try:
+                launch = engine_api.model_launch(url, model)
+                text = " ".join([launch.get("cmd") or ""] + [str(e) for e in launch.get("env") or []])
+                on = bool(re.search(r"(HIP|CUDA|ROCR)_VISIBLE_DEVICES=-1\b|(^|\s)(-ngl|--n-gpu-layers|--gpu-layers)[ =]0\b", text))
+                if not on:  # fallen back to the CPU while the GPUs were full
+                    on = any(m.get("id") == model and m.get("on_cpu") for m in engine_api.pool_state(url, timeout=1.5).get("models") or [])
+            except Exception:  # noqa: BLE001 - unknown: keep embedding on search only
+                on = False
+        self._embed_cpu = (model, now, on)
+        return on
+
     def escalate_model(self) -> str:
         """The bigger model a hard question goes to, or "" when there is none."""
         return str(self.settings.get("assistant").get("escalate_model") or "").strip()

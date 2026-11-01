@@ -84,3 +84,22 @@ def test_warm_embed_without_an_embedding_model_is_a_no_op(client, app, monkeypat
     a, loaded, _unloaded = engine_pair(client, app, monkeypatch)
     client.put("/api/settings/memory", json={"model": "", "enabled": True})
     assert a.warm_embed() is False and loaded == []
+
+
+def test_a_cpu_only_embedder_embeds_as_records_come_in(client, app, monkeypatch):
+    from src.integrations import engine_api
+    a = app.extensions["pb"].assistant
+    client.put("/api/settings/integrations", json={"engine_url": "http://engine"})
+    client.put("/api/settings/memory", json={"model": "embed--cpu"})
+    launches = {"embed--cpu": {"cmd": "llama-server -m /m/e.gguf --embedding -ngl 99", "env": ["HIP_VISIBLE_DEVICES=-1"]},
+                "embed--gpu": {"cmd": "llama-server -m /m/e.gguf --embedding -ngl 99", "env": ["HIP_VISIBLE_DEVICES=0"]}}
+    pool = {"models": []}
+    monkeypatch.setattr(engine_api, "model_launch", lambda url, mid, timeout=3.0: launches.get(mid, {}))
+    monkeypatch.setattr(engine_api, "pool_state", lambda url, timeout=3.0: pool)
+    assert a.embed_on_cpu() is True, "its GPUs are hidden"
+
+    client.put("/api/settings/memory", json={"model": "embed--gpu"})
+    assert a.embed_on_cpu() is False, "on a GPU it waits for a search, as before"
+    a._embed_cpu = None
+    pool["models"] = [{"id": "embed--gpu", "on_cpu": True}]
+    assert a.embed_on_cpu() is True, "fallen back to the CPU while the GPUs were full"

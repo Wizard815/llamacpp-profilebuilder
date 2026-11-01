@@ -163,9 +163,15 @@ def create_app(config: dict | None = None) -> Flask:
     memory.extra_sources.append(odysseus_hub.brain_source(settings.all))
 
     def watch_memory():
-        """Keep the assistant's memory current: new records every tick. Embedding waits for a search (see sync)."""
-        if settings.get("memory")["enabled"]:
-            memory.sync(budget=64, embed=False)
+        """Keep the assistant's memory current: new records every tick. Embedding waits for a search (see sync),
+        unless the embedding model runs on the CPU: it takes nothing from the GPUs, so it embeds as it goes."""
+        if not settings.get("memory")["enabled"]:
+            return
+        pb = app.extensions.get("pb")
+        on_cpu = bool(pb and pb.assistant and pb.assistant.embed_on_cpu())
+        done = memory.sync(budget=128, embed=on_cpu)
+        if (done or {}).get("embedded"):
+            memory.last_used = time.time()  # it is working: the idle timer does not unload it under the work
 
     def watch_inventory():
         """Keep the load history current, and look for new models and settings every ten minutes."""
