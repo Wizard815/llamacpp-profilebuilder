@@ -1735,6 +1735,7 @@ async function refreshLaunches() {
 
 function launchState(l) {
   if (!l) return ["", "no launch selected"];
+  if (l.engine && l.state === "failed") return ["bad", "failed"];
   if (l.engine) return l.ready ? ["on", "ready"] : ["warn", `${l.state || "starting"}…`];
   if (l.running) return l.ready ? ["on", "ready"] : ["warn", "starting…"];
   if (l.stopped) return ["", "stopped"];
@@ -1756,7 +1757,8 @@ function renderLaunches() {
   fill($("#gLaunches"), list.length ? list : h("div", { class: "empty" }, "Nothing started here yet. Pick a model above and Launch it to test it. Models already running in the engine are on the Logs page."));
   const cur = S.launches.find((l) => l.launch_id === S.sel);
   const [dot, label] = launchState(cur);
-  fill($("#gState"), cur ? h("span", { class: `pill ${dot === "on" ? "ok" : dot === "bad" ? "bad" : ""}` }, h("span", { class: `dot ${dot}` }), label) : null);
+  fill($("#gState"), cur ? h("span", { class: `pill ${dot === "on" ? "ok" : dot === "bad" ? "bad" : ""}`, title: cur.error || "" }, h("span", { class: `dot ${dot}` }), label) : null,
+    cur && cur.error ? h("code", { class: "mono-sm", style: "margin-left:8px;white-space:normal;word-break:break-all", title: (cur.tail || []).join("\n") }, cur.error) : null);
   $("#gBench").disabled = !(cur && cur.running && cur.ready);
   $("#gRecord").disabled = !cur;
   $("#gStop").disabled = !(cur && cur.running);
@@ -5056,12 +5058,16 @@ function sharingCard(models, plan) {
 function crashCard(models) {
   const hit = models.filter((m) => m.crash);
   if (!hit.length) return null;
-  return h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Crashes"), h("span", { class: "spacer" }),
-    h("span", { class: "hint" }, "last 10 minutes · 3 crashes and requests stop starting it; Load it from ⋯ to try again")),
-  h("div", { class: "table-wrap" }, simpleTable(["Model", "When", "Times", "Died on", ""], hit.map((m) => [
+  return h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Crashes and failed starts"), h("span", { class: "spacer" }),
+    h("span", { class: "hint" }, "kept until the model starts again, or Dismiss · 3 in 10 minutes and requests stop starting it; Load it from ⋯ to try again")),
+  h("div", { class: "table-wrap" }, simpleTable(["Model", "When", "Times", "Died on", "", ""], hit.map((m) => [
     h("span", { class: "strong" }, m.id), ago(Date.parse(m.crash.at) / 1000), String(m.crash.recent),
-    h("code", { class: "mono-sm", style: "white-space:normal;word-break:break-all" }, m.crash.line),
-    m.crash.blocked ? h("span", { class: "pill bad", title: "requests for it get an error instead of starting it again" }, "not restarted") : h("span", { class: "pill warn" }, "restarts on the next request")]))));
+    h("div", {}, h("code", { class: "mono-sm", style: "white-space:normal;word-break:break-all" }, m.crash.line),
+      (m.crash.tail || []).length > 1 ? h("details", {}, h("summary", { class: "hint" }, "its last lines"),
+        h("pre", { class: "pre mono-sm", style: "white-space:pre-wrap;margin:4px 0 0" }, m.crash.tail.join("\n"))) : null),
+    m.crash.blocked ? h("span", { class: "pill bad", title: "requests for it get an error instead of starting it again" }, "not restarted") : h("span", { class: "pill warn" }, "restarts on the next request"),
+    h("button", { class: "btn sm ghost", title: "Clear this note (the model is not started)", onclick: async () => {
+      try { await api("POST", `/api/schedule/live/${encodeURIComponent(m.id)}/dismiss`); loadLive(); } catch (e) { fail(e); } } }, "Dismiss")]))));
 }
 function prefillCard(models) {
   const busy = models.flatMap((m) => (m.slots || []).map((sl) => ({ m, sl })));

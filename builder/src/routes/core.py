@@ -355,6 +355,14 @@ def _engine_running(c) -> list[dict]:
         return []
     seen = {mid: {"started_at": t} for mid, t in c.store.open_session_starts().items()}
     out = []
+    # a model that failed to start, or crashed, stays listed with why, instead of just vanishing
+    failed = {}
+    try:
+        for m in (engine_api.pool_state(url, timeout=1.5) or {}).get("models") or []:
+            if m.get("crash") and m.get("state") == "stopped":
+                failed[m["id"]] = m["crash"]
+    except Exception:  # noqa: BLE001 - another router, or the engine is busy: nothing to add
+        pass
     for m in running:
         mid, state = str(m["model"]), str(m.get("state") or "ready")
         out.append({"launch_id": ENGINE_PREFIX + mid, "command": m.get("cmd") or "", "base_model": mid,
@@ -362,6 +370,18 @@ def _engine_running(c) -> list[dict]:
                     "started_at": (seen.get(mid) or {}).get("started_at") or time.time(),
                     "running": state in ("ready", "starting"), "ready": state == "ready", "exit_code": None,
                     "stopped": False, "engine": True, "state": state})
+    for mid, cr in failed.items():
+        if any(x["base_model"] == mid for x in out):
+            continue
+        at = cr.get("at") or ""
+        try:
+            from datetime import datetime
+            when = datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            when = time.time()
+        out.append({"launch_id": ENGINE_PREFIX + mid, "command": "", "base_model": mid, "profile_name": "", "host": "engine",
+                    "port": None, "started_at": when, "running": False, "ready": False, "exit_code": 1, "stopped": False,
+                    "engine": True, "state": "failed", "error": cr.get("line") or "", "tail": cr.get("tail") or []})
     return out
 
 

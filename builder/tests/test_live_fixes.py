@@ -82,3 +82,16 @@ def test_rescan_reaches_the_engine(app, client):
         client.put("/api/settings/integrations", json={"engine_url": url})
         j = client.post("/api/library/rescan").get_json()
     assert j["engine"] == {"ok": True, "models": 2, "changed": False}
+
+
+def test_a_model_that_failed_to_start_stays_listed_with_why(app, client):
+    crash = {"at": "2026-11-01T10:00:00Z", "line": "/app/bin/remote-llama: line 31: -LM_SSH_HOST: invalid variable name",
+             "recent": 1, "blocked": False, "tail": ["loading", "/app/bin/remote-llama: line 31: -LM_SSH_HOST: invalid variable name"]}
+    pool = {"router": "pool", "enabled": True, "cards": [], "queue": [], "swaps": [],
+            "models": [{"id": "gemma-cpu", "state": "stopped", "crash": crash}, {"id": "fine", "state": "stopped"}]}
+    with serve(make_engine([], [], model_ids=["gemma-cpu", "fine"], running=[], pool=pool)) as url:
+        client.put("/api/settings/integrations", json={"engine_url": url})
+        ls = [x for x in client.get("/api/launches").get_json()["launches"] if x.get("engine")]
+    assert [x["launch_id"] for x in ls] == ["engine:gemma-cpu"]
+    assert ls[0]["state"] == "failed" and ls[0]["running"] is False and "invalid variable name" in ls[0]["error"]
+    assert ls[0]["tail"][-1].endswith("invalid variable name")

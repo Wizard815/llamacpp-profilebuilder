@@ -454,3 +454,18 @@ func keys[V any](m map[string]V) []string {
 	}
 	return out
 }
+
+// TestParseCommand_DioKeepsAWrappersFirstWord: remote-llama reads its first
+// word as the backend, so "-lm dio" must not go in front of it.
+func TestParseCommand_DioKeepsAWrappersFirstWord(t *testing.T) {
+	p, err := ParseCommand("HIP_VISIBLE_DEVICES=-1 /app/bin/remote-llama rocm -m /app/models/g.gguf -ngl 0 --port 8000", true)
+	if err != nil {
+		t.Fatalf("ParseCommand: %v", err)
+	}
+	if len(p.Argv) < 2 || p.Argv[1] != "rocm" {
+		t.Fatalf("the backend word moved: %v", p.Argv)
+	}
+	if i := indexOf(p.Argv, "-lm"); i < 0 || p.Argv[i+1] != "dio" {
+		t.Errorf("-lm dio missing: %v", p.Argv)
+	}
+}

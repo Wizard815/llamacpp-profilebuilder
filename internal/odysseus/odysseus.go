@@ -407,7 +407,10 @@ func ParseCommand(cmd string, ensureDio bool) (Parsed, error) {
 	}
 
 	if ensureDio && indexOf(argv, "-lm") < 0 && indexOf(argv, "--load-mode") < 0 {
-		argv = append([]string{argv[0], "-lm", "dio"}, argv[1:]...)
+		// at the end, like --port: right after the program it went in front of a
+		// wrapper's own first word (remote-llama rocm ...), which then read
+		// "-lm" as the backend name
+		argv = append(argv, "-lm", "dio")
 	}
 	if !hasPort(argv) {
 		argv = append(argv, "--port", "${PORT}")

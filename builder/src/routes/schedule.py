@@ -298,6 +298,12 @@ def live_action(model_id, action):
         url = _engine_url()
     except ValueError as exc:
         return err(str(exc), 409)
+    if action == "dismiss":  # the crash note goes; the model is not started
+        try:
+            engine_api.clear_crashes(url, model_id)
+        except Exception as exc:  # noqa: BLE001
+            return err(f"could not reach the engine: {exc}", 502)
+        return ok()
     # say what is true: unloading a model that is not loaded, or loading one the engine has never heard of,
     # used to answer "ok" and leave a misleading event behind
     try:

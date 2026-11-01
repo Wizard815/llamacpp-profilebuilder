@@ -68,9 +68,35 @@ func TestCrash_OldCrashesExpire(t *testing.T) {
 	cr, ok := c.Get("m")
 	require.True(t, ok)
 	assert.Equal(t, 2, cr.Recent, "the first was twelve minutes before the third")
-	assert.Equal(t, "exited while starting, without an error line (check its log)", cr.Line)
+	assert.Equal(t, "exited while starting without printing anything (check its log)", cr.Line)
 	assert.False(t, cr.Blocked, "three crashes over twelve minutes are not three in ten")
 	now = now.Add(11 * time.Minute)
+	cr, ok = c.Get("m")
+	assert.True(t, ok, "a failure stays on show until the model starts again")
+	assert.False(t, cr.Blocked)
+	c.State("m", "starting", "ready")
 	_, ok = c.Get("m")
-	assert.False(t, ok, "nothing in the last ten minutes")
+	assert.False(t, ok, "it started: gone")
+}
+
+// A failure no pattern knows still says what the process printed last: a
+// wrapper's shell error, here remote-llama reading a flag as its backend.
+func TestCrash_KeepsTheLastLinesItPrinted(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := newCrashWatch(func() time.Time { return now }, nil)
+	c.State("m", "stopped", "starting")
+	c.line("m", []byte("starting the model"))
+	c.line("m", []byte("/app/bin/remote-llama: line 31: -LM_SSH_HOST: invalid variable name"))
+	c.State("m", "starting", "stopped")
+	cr, ok := c.Get("m")
+	require.True(t, ok)
+	assert.Equal(t, "/app/bin/remote-llama: line 31: -LM_SSH_HOST: invalid variable name", cr.Line)
+	assert.Equal(t, []string{"starting the model", "/app/bin/remote-llama: line 31: -LM_SSH_HOST: invalid variable name"}, cr.Tail)
+
+	c.State("n", "stopped", "starting")
+	c.line("n", []byte("loading"))
+	c.line("n", []byte("some odd last words"))
+	c.State("n", "starting", "stopped")
+	cr, _ = c.Get("n")
+	assert.Equal(t, "some odd last words", cr.Line, "no known error line: the last thing it said")
 }

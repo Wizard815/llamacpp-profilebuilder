@@ -16,7 +16,13 @@ import (
 // crashes close together, stops starting it until someone loads it by hand.
 var reFatal = regexp.MustCompile(`(?i)GGML_ASSERT|ggml_abort|segmentation fault|core dumped|terminate called|` +
 	`\b(cuda|hip|rocm|hsa|vulkan) error|out of memory|failed to allocate|illegal memory access|SIGSEGV|SIGABRT|` +
-	`error while loading shared libraries|failed to load model`)
+	`error while loading shared libraries|failed to load model|invalid variable name|command not found|` +
+	`No such file or directory|Permission denied|is not set|cannot (open|find|connect)|Connection refused|` +
+	`^usage:|\bfatal\b|panic:|Traceback`)
+
+// crashTailLines is how many of a model's last log lines a crash keeps, so a
+// failure no pattern above knows still says what the process last printed.
+const crashTailLines = 6
 
 const (
 	// crashLimit crashes within crashWindow stop the engine from starting the
@@ -36,6 +42,8 @@ type Crash struct {
 	// Blocked is true once Recent reaches crashLimit: requests for the model
 	// are refused instead of starting it again.
 	Blocked bool `json:"blocked"`
+	// Tail is the last lines the process printed before it exited.
+	Tail []string `json:"tail,omitempty"`
 }
 
 // CrashWatch follows each model's process: its fatal lines (fed from the same
@@ -43,7 +51,8 @@ type Crash struct {
 type CrashWatch struct {
 	mu     sync.Mutex
 	now    func() time.Time
-	fatal  map[string]string // first fatal line since the process started
+	fatal  map[string]string   // first fatal line since the process started
+	tail   map[string][]string // its last lines since it started
 	times  map[string][]time.Time
 	last   map[string]Crash
 	forget func(model string)
@@ -57,7 +66,7 @@ var watchExits sync.Once
 func init() { Prefills.onLine = Crashes.line }
 
 func newCrashWatch(now func() time.Time, forget func(string)) *CrashWatch {
-	return &CrashWatch{now: now, fatal: map[string]string{}, times: map[string][]time.Time{}, last: map[string]Crash{}, forget: forget}
+	return &CrashWatch{now: now, fatal: map[string]string{}, tail: map[string][]string{}, times: map[string][]time.Time{}, last: map[string]Crash{}, forget: forget}
 }
 
 // WatchExits subscribes the engine's watch to process state changes, once.
@@ -69,16 +78,21 @@ func WatchExits() {
 
 // line reads one log line of a model.
 func (c *CrashWatch) line(model string, line []byte) {
-	if !reFatal.Match(line) {
+	s := strings.TrimSpace(string(line))
+	if s == "" {
 		return
+	}
+	if len(s) > 300 {
+		s = s[:300] + "…"
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.fatal[model] == "" {
-		s := strings.TrimSpace(string(line))
-		if len(s) > 300 {
-			s = s[:300] + "…"
-		}
+	t := append(c.tail[model], s)
+	if len(t) > crashTailLines {
+		t = t[len(t)-crashTailLines:]
+	}
+	c.tail[model] = t
+	if c.fatal[model] == "" && reFatal.MatchString(s) {
 		c.fatal[model] = s
 	}
 }
@@ -90,6 +104,13 @@ func (c *CrashWatch) State(model, from, to string) {
 	if to == "starting" {
 		c.mu.Lock()
 		delete(c.fatal, model) // a new run: its own lines from here
+		delete(c.tail, model)
+		c.mu.Unlock()
+		return
+	}
+	if to == "ready" {
+		c.mu.Lock()
+		delete(c.last, model) // it started: the last failure is no longer the news
 		c.mu.Unlock()
 		return
 	}
@@ -112,24 +133,33 @@ func (c *CrashWatch) State(model, from, to string) {
 		}
 	}
 	c.times[model] = recent
+	tail := append([]string(nil), c.tail[model]...)
 	line := c.fatal[model]
+	if line == "" && len(tail) > 0 {
+		line = tail[len(tail)-1] // no known error line: the last thing it said
+	}
 	if line == "" {
 		if from == "starting" {
-			line = "exited while starting, without an error line (check its log)"
+			line = "exited while starting without printing anything (check its log)"
 		} else {
-			line = "exited without an error line (check its log)"
+			line = "exited without printing anything (check its log)"
 		}
 	}
-	c.last[model] = Crash{At: now, Line: line, Recent: len(recent), Blocked: len(recent) >= crashLimit}
+	c.last[model] = Crash{At: now, Line: line, Recent: len(recent), Blocked: len(recent) >= crashLimit, Tail: tail}
 }
 
-// Get reports a model's last crash within crashWindow.
+// Get reports a model's last crash, until it starts again or is cleared: a
+// failure stays on show however long ago it was. Blocked only holds within
+// crashWindow.
 func (c *CrashWatch) Get(model string) (Crash, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cr, ok := c.last[model]
-	if !ok || c.now().Sub(cr.At) >= crashWindow {
+	if !ok {
 		return Crash{}, false
+	}
+	if c.now().Sub(cr.At) >= crashWindow {
+		cr.Blocked = false
 	}
 	return cr, true
 }
@@ -148,4 +178,5 @@ func (c *CrashWatch) Clear(model string) {
 	delete(c.times, model)
 	delete(c.last, model)
 	delete(c.fatal, model)
+	delete(c.tail, model)
 }
