@@ -149,11 +149,13 @@ def choices():
     library = scan_models(c.settings.get("paths")["models_dir"])
     chat, embed, seen = [], [], set()
     variants = {(p.get("fields") or {}).get("profile_id"): variant_id(p) for p in core.cookbook_state()["presets"]}
+    kind_by_file = {os.path.basename(m["path"]): m["kind"] for m in library}
     for p in c.store.list_profiles():
         vid = variants.get(p["profile_id"])
         if vid and vid not in seen:
             seen.add(vid)
-            chat.append({"id": vid, "label": p["name"], "group": "Profiles", "listed": vid in listed})
+            item = {"id": vid, "label": p["name"], "group": "Profiles", "listed": vid in listed}
+            (embed if _embeds(p.get("launch_command") or "", kind_by_file) else chat).append(item)
     for m in library:
         if m["id"] in seen:
             continue
@@ -164,6 +166,19 @@ def choices():
         item = {"id": mid, "label": mid, "group": "Also in the engine", "listed": True}
         (embed if re.search(r"(?i)embed|(?<![a-z])(bge|e5|gte)-|rerank", mid) else chat).append(item)
     return ok(chat=chat, embed=embed, engine_connected=connected)
+
+
+def _embeds(command: str, kind_by_file: dict) -> bool:
+    """A profile that serves embeddings: --embedding (or --pooling / --rerank) in its command, or a model file the
+    library knows as an embedding or reranker model."""
+    from ..command import parse_command
+    try:
+        cmd = parse_command(command)
+    except ValueError:
+        return False
+    if any(cmd.has(f) for f in ("embedding", "embeddings", "pooling", "rerank", "reranking")):
+        return True
+    return kind_by_file.get(os.path.basename(cmd.summary()["model"] or "")) in ("embedding", "reranker")
 
 
 def _local_model(models_dir: str, pattern: str, want: str):

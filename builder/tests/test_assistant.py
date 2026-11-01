@@ -190,6 +190,17 @@ def test_choices_offer_profiles_library_models_and_embeddings(client, app):
     assert [c["id"] for c in r["embed"]] == ["nomic-embed-text-v1.5.q8_0"], "embedding models only, and no audio models"
 
 
+    # a profile of an embedding model is offered for the memory, not as a chat model
+    nomic = os.path.join(root, "embed", "nomic-embed-text-v1.5.Q8_0.gguf").replace("\\", "/")
+    client.post("/api/profiles", json={"name": "nomic big batch", "launch_command": f"llama-server --model {nomic} -ub 2048 --port 8080"})
+    client.post("/api/profiles", json={"name": "qwen as embedder", "launch_command": f"llama-server --model {path} --embedding --pooling last --port 8080"})
+    r = client.get("/api/assistant/choices").get_json()
+    embed = {c["label"]: c for c in r["embed"]}
+    assert embed["nomic big batch"]["group"] == "Profiles" and embed["nomic big batch"]["id"].startswith("nomic-embed-text-v1.5.q8_0--")
+    assert "qwen as embedder" in embed, "--embedding in the command makes it one"
+    assert {c["label"] for c in r["chat"] if c["group"] == "Profiles"} == {"Assistant fast"}
+
+
 def test_model_focus_knows_a_model_that_has_never_been_run(client, app):
     """A model Argos can see is a model the assistant can talk about.
 

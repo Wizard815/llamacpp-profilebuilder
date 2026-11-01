@@ -3722,7 +3722,7 @@ function renderAssistantSettings() {
       h("p", { class: "hint" }, "Pick one of your embedding models (nomic-embed, bge, e5, gte…). There is nothing to connect: the engine serves it like any other model and loads it when the memory needs it."),
       h("div", { class: "fields" },
         h("label", { class: "check wide" }, memOn, "Use the memory"),
-        field("Embedding model", embed, ch.embed.length ? `${ch.embed.length} embedding model${ch.embed.length === 1 ? "" : "s"} in your library` : "No embedding models in your library yet. Download one under Models (search “nomic-embed”).", true),
+        field("Embedding model", embed, ch.embed.length ? `${ch.embed.length} to choose from: embedding models and their profiles` : "No embedding models or profiles yet. Download one under Models (search “nomic-embed”), or save a profile with --embedding.", true),
         field("Records per question", results)),
       h("details", { class: "advanced" }, h("summary", {}, "Advanced: embeddings from another server"),
         h("div", { class: "fields", style: "margin-top:8px" },
